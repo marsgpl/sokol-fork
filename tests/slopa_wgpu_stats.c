@@ -65,6 +65,12 @@ void wgpuQueueSubmit(WGPUQueue queue, size_t count, const WGPUCommandBuffer* buf
     calls.submits++;
 }
 
+// These tests never create or retire owned public resources.
+void wgpuBufferDestroy(WGPUBuffer buffer) { (void)buffer; assert(false); }
+void wgpuBufferRelease(WGPUBuffer buffer) { (void)buffer; assert(false); }
+void wgpuTextureDestroy(WGPUTexture texture) { (void)texture; assert(false); }
+void wgpuTextureRelease(WGPUTexture texture) { (void)texture; assert(false); }
+
 static void reset(void) {
     static uint8_t staging[4096];
     if (_sg.wgpu.uniform.records) _sg_free(_sg.wgpu.uniform.records);
