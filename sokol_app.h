@@ -2228,8 +2228,12 @@ SOKOL_APP_API_DECL uint32_t sapp_html5_get_dropped_file_size(int index);
 /* HTML5: asynchronously load the content of a dropped file */
 SOKOL_APP_API_DECL void sapp_html5_fetch_dropped_file(const sapp_html5_fetch_request* request);
 
+/* PATCH(slopa) runtime render scale (0.25..1): framebuffer = window * dpi * scale */
+SOKOL_APP_API_DECL void sapp_set_render_scale(float scale);
 /* macOS: get bridged pointer to macOS NSWindow */
 SOKOL_APP_API_DECL const void* sapp_macos_get_window(void);
+/* macOS+Metal: PATCH(slopa) runtime DisplayLink fps cap, 0 = display max (battery saver) */
+SOKOL_APP_API_DECL void sapp_macos_set_frame_rate_cap(int fps);
 /* iOS: get bridged pointer to iOS UIWindow */
 SOKOL_APP_API_DECL const void* sapp_ios_get_window(void);
 
@@ -2803,6 +2807,9 @@ typedef struct {
         CAMetalLayer* layer;
         CADisplayLink* display_link;
         NSTimer* fallback_timer;
+        // PATCH(slopa): runtime fps cap (battery saver), 0 = none. honored by
+        // _sapp_macos_mtl_start_display_link + sapp_macos_set_frame_rate_cap
+        int fps_cap;
         id<MTLTexture> depth_tex;
         id<MTLTexture> msaa_tex;
         // NOTE: CADisplayLink.timestamp seems to be very stable, so we'll use
@@ -3273,6 +3280,7 @@ typedef struct {
     int sample_count;
     int swap_interval;
     float dpi_scale;
+    float render_scale; // PATCH(slopa): sapp_set_render_scale, multiplies dpi_scale
     uint64_t frame_count;
     sapp_event event;
     _sapp_mouse_t mouse;
@@ -3580,6 +3588,7 @@ _SOKOL_PRIVATE void _sapp_init_state(const sapp_desc* desc) {
     _sapp_strcpy(_sapp.desc.window_title, _sapp.window_title, sizeof(_sapp.window_title));
     _sapp.desc.window_title = _sapp.window_title;
     _sapp.dpi_scale = 1.0f;
+    _sapp.render_scale = 1.0f; // PATCH(slopa)
     _sapp.fullscreen = _sapp.desc.fullscreen;
     _sapp.mouse.shown = true;
     _sapp_timing_init(&_sapp.timing);
@@ -3940,7 +3949,9 @@ _SOKOL_PRIVATE void _sapp_wgpu_create_swapchain(bool called_from_resize) {
     ds_desc.size.width = (uint32_t)_sapp.framebuffer_width;
     ds_desc.size.height = (uint32_t)_sapp.framebuffer_height;
     ds_desc.size.depthOrArrayLayers = 1;
-    ds_desc.format = WGPUTextureFormat_Depth32FloatStencil8;
+    // PATCH(slopa): plain depth, no stencil user exists (sapp_depth_format twin):
+    // the stencil plane doubled the depth tile footprint on TBDR for nothing
+    ds_desc.format = WGPUTextureFormat_Depth32Float;
     ds_desc.mipLevelCount = 1;
     ds_desc.sampleCount = (uint32_t)_sapp.sample_count;
     _sapp.wgpu.depth_stencil_tex = wgpuDeviceCreateTexture(_sapp.wgpu.device, &ds_desc);
@@ -3974,11 +3985,17 @@ _SOKOL_PRIVATE void _sapp_wgpu_create_swapchain(bool called_from_resize) {
 }
 
 _SOKOL_PRIVATE void _sapp_wgpu_discard_swapchain(bool called_from_resize) {
+    // PATCH(slopa): wgpuTextureDestroy before Release. In the browser, Release
+    // only drops the JS wrapper ref; the GPU memory waits for GC. These are the
+    // largest allocations in the app (~170MB at 4xMSAA, 3x dpr), so a few
+    // rotations of swapchain churn OOM-kill the iOS WebContent process before
+    // GC runs. destroy() frees GPU memory deterministically.
     if (_sapp.wgpu.msaa_view) {
         wgpuTextureViewRelease(_sapp.wgpu.msaa_view);
         _sapp.wgpu.msaa_view = 0;
     }
     if (_sapp.wgpu.msaa_tex) {
+        wgpuTextureDestroy(_sapp.wgpu.msaa_tex);
         wgpuTextureRelease(_sapp.wgpu.msaa_tex);
         _sapp.wgpu.msaa_tex = 0;
     }
@@ -3987,6 +4004,7 @@ _SOKOL_PRIVATE void _sapp_wgpu_discard_swapchain(bool called_from_resize) {
         _sapp.wgpu.depth_stencil_view = 0;
     }
     if (_sapp.wgpu.depth_stencil_tex) {
+        wgpuTextureDestroy(_sapp.wgpu.depth_stencil_tex);
         wgpuTextureRelease(_sapp.wgpu.depth_stencil_tex);
         _sapp.wgpu.depth_stencil_tex = 0;
     }
@@ -4101,12 +4119,18 @@ _SOKOL_PRIVATE void _sapp_wgpu_request_device_cb(WGPURequestDeviceStatus status,
 
 _SOKOL_PRIVATE void _sapp_wgpu_create_device_and_swapchain(void) {
     SOKOL_ASSERT(_sapp.wgpu.adapter);
-    size_t cur_feature_index = 1;
+    size_t cur_feature_index = 0;
     #define _SAPP_WGPU_MAX_REQUESTED_FEATURES (16)
-    WGPUFeatureName requiredFeatures[_SAPP_WGPU_MAX_REQUESTED_FEATURES] = {
-        WGPUFeatureName_Depth32FloatStencil8,
-    };
-    // check for optional features we're interested in
+    WGPUFeatureName requiredFeatures[_SAPP_WGPU_MAX_REQUESTED_FEATURES];
+    // check for optional features we're interested in.
+    // PATCH(slopa): Depth32FloatStencil8 demoted required -> optional: the
+    // swapchain is plain depth now (sapp_depth_format twin), so an adapter
+    // without the stencil format must not fail device creation. still
+    // requested when present: sg maps SG_PIXELFORMAT_DEPTH_STENCIL to it
+    // for offscreen targets
+    if (wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_Depth32FloatStencil8)) {
+        requiredFeatures[cur_feature_index++] = WGPUFeatureName_Depth32FloatStencil8;
+    }
     if (wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_TextureCompressionBC)) {
         SOKOL_ASSERT(cur_feature_index < _SAPP_WGPU_MAX_REQUESTED_FEATURES);
         requiredFeatures[cur_feature_index++] = WGPUFeatureName_TextureCompressionBC;
@@ -4190,11 +4214,19 @@ _SOKOL_PRIVATE void _sapp_wgpu_request_adapter_cb(WGPURequestAdapterStatus statu
 
 _SOKOL_PRIVATE void _sapp_wgpu_create_adapter(void) {
     SOKOL_ASSERT(_sapp.wgpu.instance);
-    // FIXME: power preference?
+    // PATCH(slopa): powerPreference low-power on mobile (heat.md H8): one
+    // GPU on phones, but the hint can influence Safari's clock governor.
+    // Desktop keeps Undefined (dual-gpu laptops must not get steered to
+    // the integrated gpu). Zeroed struct == the old null options.
+    extern bool webshell_is_mobile(void);
+    _SAPP_STRUCT(WGPURequestAdapterOptions, opts);
+    if (webshell_is_mobile()) {
+        opts.powerPreference = WGPUPowerPreference_LowPower;
+    }
     _SAPP_STRUCT(WGPURequestAdapterCallbackInfo, cb_info);
     cb_info.mode = _sapp_wgpu_callbackmode();
     cb_info.callback = _sapp_wgpu_request_adapter_cb;
-    WGPUFuture future = wgpuInstanceRequestAdapter(_sapp.wgpu.instance, 0, cb_info);
+    WGPUFuture future = wgpuInstanceRequestAdapter(_sapp.wgpu.instance, &opts, cb_info);
     #if defined(_SAPP_WGPU_HAS_WAIT)
         _sapp_wgpu_await(future);
     #else
@@ -5101,7 +5133,8 @@ _SOKOL_PRIVATE id<MTLTexture> _sapp_macos_mtl_create_texture(int width, int heig
 }
 
 _SOKOL_PRIVATE void _sapp_macos_mtl_swapchain_create(int width, int height) {
-    _sapp.macos.mtl.depth_tex =_sapp_macos_mtl_create_texture(width, height, MTLPixelFormatDepth32Float_Stencil8, _sapp.sample_count, "swapchain_depth_tex");
+    // PATCH(slopa): plain depth, no stencil user exists (sapp_depth_format twin)
+    _sapp.macos.mtl.depth_tex =_sapp_macos_mtl_create_texture(width, height, MTLPixelFormatDepth32Float, _sapp.sample_count, "swapchain_depth_tex");
     if (nil == _sapp.macos.mtl.depth_tex) {
         _SAPP_PANIC(METAL_CREATE_SWAPCHAIN_DEPTH_TEXTURE_FAILED);
     }
@@ -5178,7 +5211,11 @@ _SOKOL_PRIVATE void _sapp_macos_mtl_start_display_link(void) {
     SOKOL_ASSERT(nil != _sapp.macos.view);
     NSInteger max_fps = _sapp_macos_max_fps();
     _sapp.macos.mtl.display_link = [_sapp.macos.view displayLinkWithTarget:_sapp.macos.view selector:@selector(displayLinkFired:)];
-    const float preferred_fps = max_fps / _sapp.swap_interval;
+    // PATCH(slopa): honor the runtime fps cap (battery saver)
+    float preferred_fps = max_fps / _sapp.swap_interval;
+    if ((_sapp.macos.mtl.fps_cap > 0) && ((float)_sapp.macos.mtl.fps_cap < preferred_fps)) {
+        preferred_fps = (float)_sapp.macos.mtl.fps_cap;
+    }
     const CAFrameRateRange frame_rate_range = { preferred_fps, preferred_fps, preferred_fps };
     _sapp.macos.mtl.display_link.preferredFrameRateRange = frame_rate_range;
     [_sapp.macos.mtl.display_link addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
@@ -5625,6 +5662,7 @@ _SOKOL_PRIVATE void _sapp_macos_init_default_dimensions(void) {
     } else {
         _sapp.dpi_scale = 1.0f;
     }
+    _sapp.dpi_scale *= _sapp.render_scale; // PATCH(slopa)
     NSRect screen_rect = NSScreen.mainScreen.frame;
     // use 4/5 of screen size as default size
     const float default_widthf = (screen_rect.size.width * 4.0f) / 5.0f;
@@ -5649,6 +5687,9 @@ _SOKOL_PRIVATE void _sapp_macos_update_dimensions(void) {
     } else {
         _sapp.dpi_scale = 1.0f;
     }
+    // PATCH(slopa): runtime render scale shrinks the drawable below the
+    // backing scale; the layer stretches it back over the same bounds
+    _sapp.dpi_scale *= _sapp.render_scale;
     // NOTE: needed because we set layerContentsPlacement to a non-scaling value in windowWillStartLiveResize.
     _sapp.macos.view.layer.contentsScale = _sapp.dpi_scale;
     const NSRect bounds = [_sapp.macos.view bounds];
@@ -5887,7 +5928,13 @@ _SOKOL_PRIVATE void _sapp_macos_frame(void) {
 - (void)applicationDidFinishLaunching:(NSNotification*)aNotification {
     _SOKOL_UNUSED(aNotification);
     // NOTE: keep activationPolicy in front of window creation (see https://github.com/floooh/sokol/issues/1500)
-    NSApp.activationPolicy = NSApplicationActivationPolicyRegular;
+    #if defined(GAME_CAPE_VALIDATION)
+        // PATCH(slopa): the automated Metal cape scene must never activate or
+        // move the developer to its Space while it renders.
+        NSApp.activationPolicy = NSApplicationActivationPolicyAccessory;
+    #else
+        NSApp.activationPolicy = NSApplicationActivationPolicyRegular;
+    #endif
     _sapp_macos_init_cursors();
     if ((_sapp.window_width == 0) || (_sapp.window_height == 0)) {
         _sapp_macos_init_default_dimensions();
@@ -5920,28 +5967,44 @@ _SOKOL_PRIVATE void _sapp_macos_frame(void) {
     _sapp.macos.window.contentView = _sapp.macos.view;
     [_sapp.macos.window makeFirstResponder:_sapp.macos.view];
     [_sapp.macos.window center];
+    #if defined(GAME_CAPE_VALIDATION)
+        // PATCH(slopa): keep the CAMetalLayer ordered and drawable, but never
+        // cover the developer's work or accept an accidental click.
+        _sapp.macos.window.alphaValue = 0.0;
+        _sapp.macos.window.ignoresMouseEvents = YES;
+        _sapp.macos.window.collectionBehavior =
+            NSWindowCollectionBehaviorCanJoinAllSpaces |
+            NSWindowCollectionBehaviorStationary |
+            NSWindowCollectionBehaviorIgnoresCycle;
+    #endif
     _sapp.valid = true;
     if (_sapp.fullscreen) {
         /* ^^^ on GL, this already toggles a rendered frame, so set the valid flag before */
         [_sapp.macos.window toggleFullScreen:self];
     }
-    [NSApp activateIgnoringOtherApps:YES];
-    [_sapp.macos.window makeKeyAndOrderFront:nil];
+    #if defined(GAME_CAPE_VALIDATION)
+        [_sapp.macos.window orderBack:nil];
+    #else
+        [NSApp activateIgnoringOtherApps:YES];
+        [_sapp.macos.window makeKeyAndOrderFront:nil];
+    #endif
     _sapp_macos_update_dimensions();
 
     // workaround for window not being focused during a long init callback
     // for details see: https://github.com/floooh/sokol/pull/982
     // also see: https://gitlab.gnome.org/GNOME/gtk/-/issues/2342
-    NSEvent *focusevent = [NSEvent otherEventWithType:NSEventTypeAppKitDefined
-        location:NSZeroPoint
-        modifierFlags:0x40
-        timestamp:0
-        windowNumber:0
-        context:nil
-        subtype:NSEventSubtypeApplicationActivated
-        data1:0
-        data2:0];
-    [NSApp postEvent:focusevent atStart:YES];
+    #if !defined(GAME_CAPE_VALIDATION)
+        NSEvent *focusevent = [NSEvent otherEventWithType:NSEventTypeAppKitDefined
+            location:NSZeroPoint
+            modifierFlags:0x40
+            timestamp:0
+            windowNumber:0
+            context:nil
+            subtype:NSEventSubtypeApplicationActivated
+            data1:0
+            data2:0];
+        [NSApp postEvent:focusevent atStart:YES];
+    #endif
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
@@ -7486,6 +7549,23 @@ _SOKOL_PRIVATE uint32_t _sapp_emsc_touch_event_mods(const EmscriptenTouchEvent* 
     return m;
 }
 
+// PATCH(slopa): single place computing dpi_scale on the web.
+// 1) clamps DPR to 2: DPR-3 phones pay ~2.25x fragment fill for no visible
+//    gain (main heat source). Mirrored in renderer.ts watchCanvasSize.
+// 2) folds in the runtime render scale (sapp_set_render_scale).
+// Input coords are dpi_scale-derived too, so framebuffer, input and the
+// dpi-based UI layout all stay consistent whatever the scale.
+_SOKOL_PRIVATE void _sapp_emsc_update_dpi_scale(void) {
+    float dpi_scale = 1.0f;
+    if (_sapp.desc.high_dpi) {
+        dpi_scale = (float) emscripten_get_device_pixel_ratio();
+        if (dpi_scale > 2.0f) {
+            dpi_scale = 2.0f;
+        }
+    }
+    _sapp.dpi_scale = dpi_scale * _sapp.render_scale;
+}
+
 _SOKOL_PRIVATE EM_BOOL _sapp_emsc_size_changed(int event_type, const EmscriptenUiEvent* ui_event, void* user_data) {
     _SOKOL_UNUSED(event_type);
     _SOKOL_UNUSED(user_data);
@@ -7521,11 +7601,19 @@ _SOKOL_PRIVATE EM_BOOL _sapp_emsc_size_changed(int event_type, const EmscriptenU
     } else {
         _sapp.window_height = _sapp_roundf_gzero(h);
     }
-    if (_sapp.desc.high_dpi) {
-        _sapp.dpi_scale = emscripten_get_device_pixel_ratio();
+    _sapp_emsc_update_dpi_scale(); // PATCH(slopa)
+    // PATCH(slopa): skip no-op resizes. iOS standalone PWAs fire resize with
+    // stale pre-rotation layout (WebKit bug 170595); resizing the canvas
+    // backing store + recreating the WGPU swapchain each time leaks canvas
+    // memory in WebKit until the tab crashes. play.ts dispatches a synthetic
+    // resize once layout settles, which lands here with the real size.
+    const int fb_w = _sapp_roundf_gzero(w * _sapp.dpi_scale);
+    const int fb_h = _sapp_roundf_gzero(h * _sapp.dpi_scale);
+    if ((fb_w == _sapp.framebuffer_width) && (fb_h == _sapp.framebuffer_height)) {
+        return true;
     }
-    _sapp.framebuffer_width = _sapp_roundf_gzero(w * _sapp.dpi_scale);
-    _sapp.framebuffer_height = _sapp_roundf_gzero(h * _sapp.dpi_scale);
+    _sapp.framebuffer_width = fb_w;
+    _sapp.framebuffer_height = fb_h;
     emscripten_set_canvas_element_size(_sapp.html5_canvas_selector, _sapp.framebuffer_width, _sapp.framebuffer_height);
     #if defined(SOKOL_WGPU)
         // on WebGPU: recreate size-dependent rendering surfaces
@@ -8052,9 +8140,7 @@ _SOKOL_PRIVATE void _sapp_emsc_run(const sapp_desc* desc) {
         emscripten_get_element_css_size(_sapp.html5_canvas_selector, &w, &h);
         emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, 0, false, _sapp_emsc_size_changed);
     }
-    if (_sapp.desc.high_dpi) {
-        _sapp.dpi_scale = emscripten_get_device_pixel_ratio();
-    }
+    _sapp_emsc_update_dpi_scale(); // PATCH(slopa), same as the resize path
     _sapp.window_width = _sapp_roundf_gzero(w);
     _sapp.window_height = _sapp_roundf_gzero(h);
     _sapp.framebuffer_width = _sapp_roundf_gzero(w * _sapp.dpi_scale);
@@ -13997,7 +14083,12 @@ SOKOL_API_IMPL sapp_pixel_format sapp_color_format(void) {
 }
 
 SOKOL_API_IMPL sapp_pixel_format sapp_depth_format(void) {
-    return SAPP_PIXELFORMAT_DEPTH_STENCIL;
+    // PATCH(slopa): plain depth - nothing uses stencil, and this flows through
+    // sokol_glue into the sg pipeline defaults, so every swapchain pipeline
+    // follows without a game-side change. the actual textures are patched in
+    // the wgpu + macos swapchain_create twins (iOS/D3D11/Vulkan/GL untouched:
+    // not shipped)
+    return SAPP_PIXELFORMAT_DEPTH;
 }
 
 SOKOL_API_IMPL int sapp_sample_count(void) {
@@ -14439,6 +14530,38 @@ SOKOL_API_IMPL sapp_swapchain sapp_get_swapchain(void) {
     return res;
 }
 
+// PATCH(slopa): runtime render scale for the game's quality setting. The
+// framebuffer shrinks (fewer shaded pixels on a weak gpu) while the window /
+// canvas keeps its size and the compositor upscales. Everything else is
+// derived from dpi_scale (input coords, the game's UI layout), so no call
+// site needs to know. Must not be called while a render pass is recording:
+// it resizes the swapchain.
+SOKOL_API_IMPL void sapp_set_render_scale(float scale) {
+    if (scale < 0.25f) { scale = 0.25f; }
+    if (scale > 1.0f) { scale = 1.0f; }
+    if (_sapp.render_scale == scale) { return; }
+    _sapp.render_scale = scale;
+    if (!_sapp.valid) { return; } // picked up by the init-time dpi math
+    #if defined(_SAPP_MACOS)
+        #if defined(SOKOL_METAL)
+            // the layer default is kCAFilterNearest: a reduced drawable would
+            // upscale into raw blocks
+            _sapp.macos.mtl.layer.magnificationFilter =
+                (scale < 1.0f) ? kCAFilterLinear : kCAFilterNearest;
+        #endif
+        _sapp_macos_update_dimensions();
+    #elif defined(_SAPP_EMSCRIPTEN)
+        double w, h;
+        emscripten_get_element_css_size(_sapp.html5_canvas_selector, &w, &h);
+        // a zero css size means a fullscreen toggle is mid-flight, and the
+        // resize path would need the event's window size: leave it to the
+        // resize event that follows (it re-reads render_scale anyway)
+        if ((w >= 1.0) && (h >= 1.0)) {
+            _sapp_emsc_size_changed(EMSCRIPTEN_EVENT_RESIZE, 0, 0);
+        }
+    #endif
+}
+
 SOKOL_API_IMPL const void* sapp_macos_get_window(void) {
     #if defined(_SAPP_MACOS)
         const void* obj = (__bridge const void*) _sapp.macos.window;
@@ -14446,6 +14569,25 @@ SOKOL_API_IMPL const void* sapp_macos_get_window(void) {
         return obj;
     #else
         return 0;
+    #endif
+}
+
+// PATCH(slopa): runtime DisplayLink fps cap for the game's battery saver
+// (0 = restore display max). Stored in fps_cap so a display link created on a
+// later visibility transition picks it up in _sapp_macos_mtl_start_display_link.
+SOKOL_API_IMPL void sapp_macos_set_frame_rate_cap(int fps) {
+    #if defined(_SAPP_MACOS) && defined(SOKOL_METAL)
+        _sapp.macos.mtl.fps_cap = fps;
+        if (nil != _sapp.macos.mtl.display_link) {
+            float preferred_fps = _sapp_macos_max_fps() / _sapp.swap_interval;
+            if ((fps > 0) && ((float)fps < preferred_fps)) {
+                preferred_fps = (float)fps;
+            }
+            const CAFrameRateRange frame_rate_range = { preferred_fps, preferred_fps, preferred_fps };
+            _sapp.macos.mtl.display_link.preferredFrameRateRange = frame_rate_range;
+        }
+    #else
+        _SOKOL_UNUSED(fps);
     #endif
 }
 

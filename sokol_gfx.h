@@ -3192,6 +3192,17 @@ typedef struct sg_bindings {
         the buffer content will be infrequently updated from the CPU side
     .stream_upate (default: false)
         the buffer content will be updated each frame from the CPU side
+    .gpu_write_only (default: false)
+        patch(slopa): the buffer is only ever written through sg_write_buffer_at
+        (src/sg.h), never sg_update_buffer / sg_append_buffer, so nothing
+        rotates active_slot and the renaming slots past 0 are dead memory.
+        forces num_slots = 1. see game/README.md "patch sokol: single-slot
+        gpu_write_only". no-op outside metal (gl/wgpu ignore num_slots here)
+    .readback_source (default: false)
+        patch(slopa): allow this immutable GPU-written buffer to be copied by
+        the validation-only async readback path in src/sg.c and sg_apple.mm.
+        adds WebGPU CopySrc; no-op on other backends. see game/README.md
+        "patch sokol: buffer CopySrc"
 */
 typedef struct sg_buffer_usage {
     bool vertex_buffer;
@@ -3200,6 +3211,8 @@ typedef struct sg_buffer_usage {
     bool immutable;
     bool dynamic_update;
     bool stream_update;
+    bool gpu_write_only; // patch(slopa)
+    bool readback_source; // patch(slopa)
 } sg_buffer_usage;
 
 /*
@@ -3313,6 +3326,10 @@ typedef struct sg_image_usage {
     bool immutable;
     bool dynamic_update;
     bool stream_update;
+    // patch(slopa): sg_buffer_usage.gpu_write_only's twin - written only
+    // through sg_write_image_region / sg_write_image_layer, never
+    // sg_update_image, so num_slots = 1
+    bool gpu_write_only;
 } sg_image_usage;
 
 /*
@@ -5381,6 +5398,13 @@ SOKOL_GFX_API_DECL const void* sg_mtl_render_command_encoder(void);
 SOKOL_GFX_API_DECL const void* sg_mtl_compute_command_encoder(void);
 // Metal: return __bridge-casted MTLCommandQueue
 SOKOL_GFX_API_DECL const void* sg_mtl_command_queue(void);
+// patch(slopa): Metal: return the current frame's __bridge-casted
+// MTLCommandBuffer, or zero before sg_mtl_begin_frame / after sg_commit
+SOKOL_GFX_API_DECL const void* sg_mtl_command_buffer(void);
+// patch(slopa): Metal: take the frame's in-flight semaphore NOW instead of at
+// the first update/pass, so the wait is billed where it happens. see
+// game/README.md "patch sokol: metal pre-pass update race"
+SOKOL_GFX_API_DECL void sg_mtl_begin_frame(void);
 // Metal: get internal __bridge-casted buffer resource objects
 SOKOL_GFX_API_DECL sg_mtl_buffer_info sg_mtl_query_buffer_info(sg_buffer buf);
 // Metal: get internal __bridge-casted image resource objects
@@ -6894,6 +6918,8 @@ typedef struct _sg_shader_s {
         WGPUBindGroupLayout bgl_ub;
         WGPUBindGroup bg_ub;
         WGPUBindGroupLayout bgl_view_smp;
+        // patch(slopa): safari empty-bindgroup fix, see game/README.md
+        WGPUBindGroup bg_view_smp_empty;
         // a mapping of sokol-gfx bind slots to setBindGroup dynamic-offset-array indices
         uint8_t ub_num_dynoffsets;
         uint8_t ub_dynoffsets[SG_MAX_UNIFORMBLOCK_BINDSLOTS];
@@ -8143,14 +8169,16 @@ _SOKOL_PRIVATE void _sg_buffer_common_init(_sg_buffer_common_t* cmn, const sg_bu
     cmn->append_overflow = false;
     cmn->update_frame_index = 0;
     cmn->append_frame_index = 0;
-    cmn->num_slots = desc->usage.immutable ? 1 : SG_NUM_INFLIGHT_FRAMES;
+    // patch(slopa): gpu_write_only = never rotated, so slot 1 is dead memory
+    cmn->num_slots = (desc->usage.immutable || desc->usage.gpu_write_only) ? 1 : SG_NUM_INFLIGHT_FRAMES;
     cmn->active_slot = 0;
     cmn->usage = desc->usage;
 }
 
 _SOKOL_PRIVATE void _sg_image_common_init(_sg_image_common_t* cmn, const sg_image_desc* desc) {
     cmn->upd_frame_index = 0;
-    cmn->num_slots = desc->usage.immutable ? 1 : SG_NUM_INFLIGHT_FRAMES;
+    // patch(slopa): see _sg_buffer_common_init
+    cmn->num_slots = (desc->usage.immutable || desc->usage.gpu_write_only) ? 1 : SG_NUM_INFLIGHT_FRAMES;
     cmn->active_slot = 0;
     cmn->type = desc->type;
     cmn->width = desc->width;
@@ -16229,14 +16257,10 @@ _SOKOL_PRIVATE void _sg_mtl_begin_render_pass(const sg_pass* pass, const _sg_att
     #endif
 }
 
-_SOKOL_PRIVATE void _sg_mtl_begin_pass(const sg_pass* pass, const _sg_attachments_ptrs_t* atts) {
-    SOKOL_ASSERT(pass && atts);
-    SOKOL_ASSERT(_sg.mtl.cmd_queue);
-    SOKOL_ASSERT(nil == _sg.mtl.compute_cmd_encoder);
-    SOKOL_ASSERT(nil == _sg.mtl.render_cmd_encoder);
-    SOKOL_ASSERT(nil == _sg.mtl.cur_drawable);
-    _sg_mtl_clear_state_cache();
-
+// patch(slopa): factored out of _sg_mtl_begin_pass so pre-pass buffer updates
+// can force the in-flight wait too, see game/README.md "patch sokol: metal
+// pre-pass update race"
+_SOKOL_PRIVATE void _sg_mtl_ensure_frame_cmd_buffer(void) {
     // if this is the first pass in the frame, create one command buffer and blit-cmd-encoder for the entire frame
     if (nil == _sg.mtl.cmd_buffer) {
         // block until the oldest frame in flight has finished
@@ -16253,6 +16277,17 @@ _SOKOL_PRIVATE void _sg_mtl_begin_pass(const sg_pass* pass, const _sg_attachment
             dispatch_semaphore_signal(_sg.mtl.sem);
         }];
     }
+}
+
+_SOKOL_PRIVATE void _sg_mtl_begin_pass(const sg_pass* pass, const _sg_attachments_ptrs_t* atts) {
+    SOKOL_ASSERT(pass && atts);
+    SOKOL_ASSERT(_sg.mtl.cmd_queue);
+    SOKOL_ASSERT(nil == _sg.mtl.compute_cmd_encoder);
+    SOKOL_ASSERT(nil == _sg.mtl.render_cmd_encoder);
+    SOKOL_ASSERT(nil == _sg.mtl.cur_drawable);
+    _sg_mtl_clear_state_cache();
+
+    _sg_mtl_ensure_frame_cmd_buffer();
 
     // if this is first pass in frame, get uniform buffer base pointer
     if (0 == _sg.mtl.cur_ub_base_ptr) {
@@ -16687,6 +16722,11 @@ _SOKOL_PRIVATE void _sg_mtl_dispatch(int num_groups_x, int num_groups_y, int num
 
 _SOKOL_PRIVATE void _sg_mtl_update_buffer(_sg_buffer_t* buf, const sg_range* data) {
     SOKOL_ASSERT(buf && data && data->ptr && (data->size > 0));
+    // patch(slopa): an update BEFORE the frame's first pass rotates into the
+    // slot the oldest in-flight frame may still be reading (the semaphore is
+    // only taken in the first sg_begin_pass): take it here first, see
+    // game/README.md "patch sokol: metal pre-pass update race"
+    _sg_mtl_ensure_frame_cmd_buffer();
     if (++buf->cmn.active_slot >= buf->cmn.num_slots) {
         buf->cmn.active_slot = 0;
     }
@@ -16702,6 +16742,8 @@ _SOKOL_PRIVATE void _sg_mtl_update_buffer(_sg_buffer_t* buf, const sg_range* dat
 
 _SOKOL_PRIVATE void _sg_mtl_append_buffer(_sg_buffer_t* buf, const sg_range* data, bool new_frame) {
     SOKOL_ASSERT(buf && data && data->ptr && (data->size > 0));
+    // patch(slopa): same pre-pass race as _sg_mtl_update_buffer above
+    _sg_mtl_ensure_frame_cmd_buffer();
     if (new_frame) {
         if (++buf->cmn.active_slot >= buf->cmn.num_slots) {
             buf->cmn.active_slot = 0;
@@ -16720,6 +16762,8 @@ _SOKOL_PRIVATE void _sg_mtl_append_buffer(_sg_buffer_t* buf, const sg_range* dat
 
 _SOKOL_PRIVATE void _sg_mtl_update_image(_sg_image_t* img, const sg_image_data* data) {
     SOKOL_ASSERT(img && data);
+    // patch(slopa): same pre-pass race as _sg_mtl_update_buffer above
+    _sg_mtl_ensure_frame_cmd_buffer();
     if (++img->cmn.active_slot >= img->cmn.num_slots) {
         img->cmn.active_slot = 0;
     }
@@ -16783,6 +16827,14 @@ _SOKOL_PRIVATE WGPUBufferUsage _sg_wgpu_buffer_usage(const sg_buffer_usage* usg)
     }
     if (!usg->immutable) {
         res |= (int)WGPUBufferUsage_CopyDst;
+        // patch(slopa): CopySrc too, see game/README.md (sg_copy_buffer_at
+        // keeps the land buffers' contents across a render distance grow)
+        res |= (int)WGPUBufferUsage_CopySrc;
+    }
+    // patch(slopa): immutable GPU outputs opt into the validation readback
+    // path explicitly; see game/README.md "patch sokol: buffer CopySrc"
+    if (usg->readback_source) {
+        res |= (int)WGPUBufferUsage_CopySrc;
     }
     return (WGPUBufferUsage)res;
 }
@@ -17380,7 +17432,13 @@ _SOKOL_PRIVATE void _sg_wgpu_uniform_system_set_bindgroup(void) {
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_apply_pipeline(void) {
-    _sg.wgpu.uniform.dirty = false;
+    // patch(slopa): true instead of false: force the uniform bindgroup
+    // to be set at the first draw even for shaders without any uniform
+    // blocks (empty bg_ub). safari validates that every pipeline-layout
+    // slot has a bound group; chrome allows unset empty slots. an unset
+    // slot fails the draw and safari then drops the whole command
+    // buffer of the frame (see game/README.md)
+    _sg.wgpu.uniform.dirty = true;
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_commit(void) {
@@ -18339,6 +18397,16 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_shader(_sg_shader_t* shd, const
         _SG_ERROR(WGPU_SHADER_CREATE_BINDGROUP_LAYOUT_FAILED);
         return SG_RESOURCESTATE_FAILED;
     }
+    // patch(slopa): pre-create an empty view/smp group for shaders with
+    // no views and no samplers; _sg_wgpu_apply_pipeline binds it. safari
+    // requires a bound group for every pipeline-layout slot, even empty
+    // ones (see game/README.md)
+    if (bgl_index == 0) {
+        _sg_clear(&bg_desc, sizeof(bg_desc));
+        bg_desc.layout = shd->wgpu.bgl_view_smp;
+        shd->wgpu.bg_view_smp_empty = wgpuDeviceCreateBindGroup(_sg.wgpu.dev, &bg_desc);
+        SOKOL_ASSERT(shd->wgpu.bg_view_smp_empty);
+    }
     return SG_RESOURCESTATE_VALID;
 }
 
@@ -18358,6 +18426,11 @@ _SOKOL_PRIVATE void _sg_wgpu_discard_shader(_sg_shader_t* shd) {
     if (shd->wgpu.bgl_view_smp) {
         wgpuBindGroupLayoutRelease(shd->wgpu.bgl_view_smp);
         shd->wgpu.bgl_view_smp = 0;
+    }
+    // patch(slopa): safari empty-bindgroup fix, see game/README.md
+    if (shd->wgpu.bg_view_smp_empty) {
+        wgpuBindGroupRelease(shd->wgpu.bg_view_smp_empty);
+        shd->wgpu.bg_view_smp_empty = 0;
     }
 }
 
@@ -18466,7 +18539,14 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_pipeline(_sg_pipeline_t* pip, c
         wgpu_pip_desc.multisample.count = (uint32_t)desc->sample_count;
         wgpu_pip_desc.multisample.mask = 0xFFFFFFFF;
         wgpu_pip_desc.multisample.alphaToCoverageEnabled = desc->alpha_to_coverage_enabled;
-        if (desc->color_count > 0) {
+        // patch(slopa): attach the fragment stage even with ZERO color targets,
+        // which is what every other backend does (_sg_mtl_create_pipeline sets
+        // fragmentFunction unconditionally). a depth-only pipeline may carry a
+        // real fs that DISCARDS - shadow_fade.fs dithers the object caster
+        // fade - and dropping the stage silently made every shadow dissolve a
+        // snap on webgpu while metal faded. targetCount 0 is legal: the depth
+        // attachment is the pipeline's own and both depth-only fs are void.
+        if (shd->wgpu.fragment_func.module) {
             wgpu_frag_state.module = shd->wgpu.fragment_func.module;
             wgpu_frag_state.entryPoint = _sg_wgpu_stringview(shd->wgpu.fragment_func.entry.buf);
             wgpu_frag_state.targetCount = (size_t)desc->color_count;
@@ -18587,9 +18667,9 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_compute_pass(const sg_pass* pass) {
     wgpu_pass_desc.label = _sg_wgpu_stringview(pass->label);
     _sg.wgpu.cpass_enc = wgpuCommandEncoderBeginComputePass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
     SOKOL_ASSERT(_sg.wgpu.cpass_enc);
-    // clear initial bindings
-    wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, _SG_WGPU_UB_BINDGROUP_INDEX, 0, 0, 0);
-    wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, 0, 0, 0);
+    // patch(slopa): the two null "clear initial bindings" setBindGroup calls
+    // are dropped, safari rejects a null bind group (see game/README.md).
+    // _sg_wgpu_begin_pass already cleared the bindings cache
     _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
 }
 
@@ -18637,8 +18717,6 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_render_pass(const sg_pass* pass, const _sg_at
     _sg.wgpu.rpass_enc = wgpuCommandEncoderBeginRenderPass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
     SOKOL_ASSERT(_sg.wgpu.rpass_enc);
 
-    wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, _SG_WGPU_UB_BINDGROUP_INDEX, 0, 0, 0);
-    wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, 0, 0, 0);
     _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
 }
 
@@ -18714,11 +18792,23 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_scissor_rect(int x, int y, int w, int h, bool
 _SOKOL_PRIVATE void _sg_wgpu_apply_pipeline(_sg_pipeline_t* pip) {
     SOKOL_ASSERT(pip);
     _sg_wgpu_uniform_system_on_apply_pipeline();
+    // patch(slopa): shaders without views/samplers never go through
+    // sg_apply_bindings, bind their empty group here (safari, see
+    // game/README.md)
+    const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
     if (pip->cmn.is_compute) {
         SOKOL_ASSERT(_sg.cur_pass.is_compute);
         SOKOL_ASSERT(pip->wgpu.cpip);
         SOKOL_ASSERT(_sg.wgpu.cpass_enc);
         wgpuComputePassEncoderSetPipeline(_sg.wgpu.cpass_enc, pip->wgpu.cpip);
+        if (shd->wgpu.bg_view_smp_empty) {
+            wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, shd->wgpu.bg_view_smp_empty, 0, 0);
+            // the raw bind above bypasses _sg_wgpu_set_bindgroup, so drop its
+            // redundancy cache or the next sg_apply_bindings with the
+            // previously bound group gets skipped while the empty group is
+            // actually set (draw fails with a bindgroup layout mismatch)
+            _sg_wgpu_bindings_cache_bg_update(0);
+        }
     } else {
         SOKOL_ASSERT(!_sg.cur_pass.is_compute);
         SOKOL_ASSERT(pip->wgpu.rpip);
@@ -18726,6 +18816,11 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_pipeline(_sg_pipeline_t* pip) {
         wgpuRenderPassEncoderSetPipeline(_sg.wgpu.rpass_enc, pip->wgpu.rpip);
         wgpuRenderPassEncoderSetBlendConstant(_sg.wgpu.rpass_enc, &pip->wgpu.blend_color);
         wgpuRenderPassEncoderSetStencilReference(_sg.wgpu.rpass_enc, pip->cmn.stencil.ref);
+        if (shd->wgpu.bg_view_smp_empty) {
+            wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, shd->wgpu.bg_view_smp_empty, 0, 0);
+            // see compute branch above: keep the redundancy cache honest
+            _sg_wgpu_bindings_cache_bg_update(0);
+        }
     }
 }
 
@@ -23908,6 +24003,9 @@ _SOKOL_PRIVATE bool _sg_validate_update_buffer(const _sg_buffer_t* buf, const sg
             return true;
         }
         SOKOL_ASSERT(buf && data && data->ptr);
+        // patch(slopa): gpu_write_only buffers must never take this path -
+        // with num_slots forced to 1 the rotate would overwrite the live copy
+        SOKOL_ASSERT(!buf->cmn.usage.gpu_write_only);
         _sg_validate_begin();
         _SG_VALIDATE(!buf->cmn.usage.immutable, VALIDATE_UPDATEBUF_USAGE);
         _SG_VALIDATE(buf->cmn.size >= (int)data->size, VALIDATE_UPDATEBUF_SIZE);
@@ -23927,6 +24025,7 @@ _SOKOL_PRIVATE bool _sg_validate_append_buffer(const _sg_buffer_t* buf, const sg
             return true;
         }
         SOKOL_ASSERT(buf && data && data->ptr);
+        SOKOL_ASSERT(!buf->cmn.usage.gpu_write_only); // patch(slopa)
         _sg_validate_begin();
         _SG_VALIDATE(!buf->cmn.usage.immutable, VALIDATE_APPENDBUF_USAGE);
         _SG_VALIDATE(buf->cmn.size >= (buf->cmn.append_pos + (int)data->size), VALIDATE_APPENDBUF_SIZE);
@@ -23945,6 +24044,7 @@ _SOKOL_PRIVATE bool _sg_validate_update_image(const _sg_image_t* img, const sg_i
             return true;
         }
         SOKOL_ASSERT(img && data);
+        SOKOL_ASSERT(!img->cmn.usage.gpu_write_only); // patch(slopa)
         _sg_validate_begin();
         _SG_VALIDATE(!img->cmn.usage.immutable, VALIDATE_UPDIMG_USAGE);
         _SG_VALIDATE(img->cmn.upd_frame_index != _sg.frame_index, VALIDATE_UPDIMG_ONCE);
@@ -26478,6 +26578,31 @@ SOKOL_API_IMPL const void* sg_mtl_command_queue(void) {
         }
     #else
         return 0;
+    #endif
+}
+
+SOKOL_API_IMPL const void* sg_mtl_command_buffer(void) {
+    #if defined(SOKOL_METAL)
+        if (nil != _sg.mtl.cmd_buffer) {
+            return (__bridge const void*) _sg.mtl.cmd_buffer;
+        } else {
+            return 0;
+        }
+    #else
+        return 0;
+    #endif
+}
+
+// patch(slopa): see the decl. the wait inside _sg_mtl_ensure_frame_cmd_buffer
+// is the frame's real GPU backpressure, but it lands wherever the frame's first
+// buffer update happens to sit (ik's palette upload, land's instance upload),
+// so every lag report billed it as CPU. calling this at the top of on_frame
+// pins it to one measured point. idempotent: the second caller finds the
+// command buffer already made
+SOKOL_API_IMPL void sg_mtl_begin_frame(void) {
+    #if defined(SOKOL_METAL)
+        SOKOL_ASSERT(_sg.valid);
+        _sg_mtl_ensure_frame_cmd_buffer();
     #endif
 }
 
