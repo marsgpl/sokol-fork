@@ -7,6 +7,9 @@
 static struct {
     uint32_t writes, binds, renders, computes, submits;
     uint64_t bytes;
+    uint32_t pipelines, blends, stencils;
+    WGPUColor blend_color;
+    uint32_t stencil_ref;
     WGPUPassTimestampWrites timestamps[8];
     uint32_t timestamp_count;
 } calls;
@@ -30,10 +33,10 @@ void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder pass, uint32_t inde
     assert(group);
     calls.binds++;
 }
-void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder pass, WGPUComputePipeline pipeline) { (void)pass; (void)pipeline; }
-void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder pass, WGPURenderPipeline pipeline) { (void)pass; (void)pipeline; }
-void wgpuRenderPassEncoderSetBlendConstant(WGPURenderPassEncoder pass, const WGPUColor* color) { (void)pass; (void)color; }
-void wgpuRenderPassEncoderSetStencilReference(WGPURenderPassEncoder pass, uint32_t value) { (void)pass; (void)value; }
+void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder pass, WGPUComputePipeline pipeline) { (void)pass; (void)pipeline; calls.pipelines++; }
+void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder pass, WGPURenderPipeline pipeline) { (void)pass; (void)pipeline; calls.pipelines++; }
+void wgpuRenderPassEncoderSetBlendConstant(WGPURenderPassEncoder pass, const WGPUColor* color) { (void)pass; calls.blends++; calls.blend_color = *color; }
+void wgpuRenderPassEncoderSetStencilReference(WGPURenderPassEncoder pass, uint32_t value) { (void)pass; calls.stencils++; calls.stencil_ref = value; }
 WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice device, const WGPUCommandEncoderDescriptor* desc) {
     (void)device; (void)desc;
     return (WGPUCommandEncoder)1;
@@ -237,11 +240,106 @@ static void test_unique_payloads_and_capacities(void) {
     assert(!_sg.wgpu.uniform.records && _sg.stats.cur_frame.wgpu.uniforms.size_hash == 0);
 }
 
+static void test_render_state_cache(void) {
+    reset();
+    _sg_shader_t shader = {0};
+    shader.slot.id = 1;
+    shader.slot.state = SG_RESOURCESTATE_VALID;
+    shader.cmn.required_bindings_and_uniforms = 2;
+    shader.wgpu.bg_view_smp_empty = (WGPUBindGroup)2;
+    _sg_pipeline_t pipelines[3] = {0};
+    for (int i = 1; i < 3; i++) {
+        pipelines[i].slot.id = (uint32_t)i;
+        pipelines[i].slot.state = SG_RESOURCESTATE_VALID;
+        pipelines[i].cmn.color_count = 1;
+        pipelines[i].cmn.shader = _sg_shader_ref(&shader);
+        pipelines[i].cmn.required_bindings_and_uniforms = 1;
+        pipelines[i].wgpu.rpip = (WGPURenderPipeline)(uintptr_t)i;
+    }
+    _sg.pools.pipeline_pool.size = 3;
+    _sg.pools.pipelines = pipelines;
+    _sg.cur_pass.in_pass = true;
+    _sg.cur_pass.valid = true;
+    const _sg_attachments_ptrs_t attachments = {.empty = true};
+    sg_pass render = {0};
+    render.swapchain.wgpu.render_view = (const void*)1;
+    render.action.colors[0].load_action = SG_LOADACTION_CLEAR;
+    render.action.colors[0].store_action = SG_STOREACTION_STORE;
+    _sg_wgpu_begin_pass(&render, &attachments);
+    for (int i = 0; i < 100; i++) {
+        _sg.applied_bindings_and_uniforms = 3;
+        _sg.wgpu.uniform.dirty = false;
+        sg_apply_pipeline((sg_pipeline){1 + (uint32_t)(i % 2)});
+        assert(_sg.next_draw_valid);
+        assert(_sg.required_bindings_and_uniforms == 3);
+        assert(_sg.applied_bindings_and_uniforms == 0);
+        assert(_sg.wgpu.uniform.dirty);
+    }
+    assert(calls.pipelines == 100 && calls.binds == 100);
+    assert(calls.blends == 1 && calls.stencils == 1);
+    // Each component must participate, including small differences.
+    const WGPUColor colors[] = {
+        {0.000001, 0, 0, 0}, {0.000001, 0.25, 0, 0},
+        {0.000001, 0.25, 0.5, 0}, {0.000001, 0.25, 0.5, 0.75},
+    };
+    for (int i = 0; i < 4; i++) {
+        pipelines[2].wgpu.blend_color = colors[i];
+        sg_apply_pipeline((sg_pipeline){2});
+        sg_apply_pipeline((sg_pipeline){2});
+        assert(calls.blends == 2 + (uint32_t)i && calls.stencils == 1);
+        assert(memcmp(&calls.blend_color, &colors[i], sizeof(WGPUColor)) == 0);
+    }
+    pipelines[2].cmn.stencil.ref = 7;
+    sg_apply_pipeline((sg_pipeline){2});
+    sg_apply_pipeline((sg_pipeline){2});
+    assert(calls.blends == 5 && calls.stencils == 2 && calls.stencil_ref == 7);
+    sg_apply_pipeline((sg_pipeline){1});
+    assert(calls.blends == 6 && calls.stencils == 3 && calls.stencil_ref == 0);
+    assert(calls.blend_color.r == 0 && calls.blend_color.a == 0);
+    // Native code can change these values; the public reset must restore both.
+    calls.blend_color = colors[3];
+    calls.stencil_ref = 99;
+    sg_reset_state_cache();
+    sg_apply_pipeline((sg_pipeline){1});
+    assert(calls.blends == 7 && calls.stencils == 4 && calls.stencil_ref == 0);
+    assert(calls.blend_color.r == 0 && calls.blend_color.a == 0);
+    _sg_wgpu_end_pass(&attachments);
+    _sg_wgpu_begin_pass(&render, &attachments);
+    sg_apply_pipeline((sg_pipeline){1});
+    assert(calls.blends == 8 && calls.stencils == 5);
+    _sg_wgpu_end_pass(&attachments);
+    sg_pass compute = {.compute = true};
+    _sg.cur_pass.is_compute = true;
+    pipelines[2].cmn.is_compute = true;
+    pipelines[2].wgpu.cpip = (WGPUComputePipeline)1;
+    _sg_wgpu_begin_pass(&compute, &attachments);
+    sg_apply_pipeline((sg_pipeline){2});
+    assert(calls.blends == 8 && calls.stencils == 5);
+    _sg_wgpu_end_pass(&attachments);
+    _sg.cur_pass.is_compute = false;
+    _sg_wgpu_begin_pass(&render, &attachments);
+    sg_apply_pipeline((sg_pipeline){1});
+    assert(calls.blends == 9 && calls.stencils == 6);
+    assert(_sg.stats.cur_frame.wgpu.num_set_pipeline == calls.pipelines);
+    assert(_sg.stats.cur_frame.wgpu.bindings.num_set_bindgroup == calls.binds);
+    assert(_sg.stats.cur_frame.wgpu.num_set_blend_constant == calls.blends);
+    assert(_sg.stats.cur_frame.wgpu.num_set_stencil_reference == calls.stencils);
+    sg_disable_stats();
+    sg_reset_state_cache();
+    sg_apply_pipeline((sg_pipeline){1});
+    sg_apply_pipeline((sg_pipeline){1});
+    assert(calls.blends == 10 && calls.stencils == 7);
+    assert(_sg.stats.cur_frame.wgpu.num_set_blend_constant == 9);
+    assert(_sg.stats.cur_frame.wgpu.num_set_stencil_reference == 6);
+    _sg_wgpu_end_pass(&attachments);
+}
+
 int main(void) {
+    test_render_state_cache();
     test_padding();
     test_uniform_and_empty_binds();
     test_real_pass_timestamps();
     test_external_frame_lifetime();
     test_unique_payloads_and_capacities();
-    puts("Sokol WebGPU instrumentation: 5 tests passed");
+    puts("Sokol WebGPU instrumentation: 6 tests passed");
 }

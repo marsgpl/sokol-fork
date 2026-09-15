@@ -4355,6 +4355,8 @@ typedef struct sg_frame_stats_wgpu {
     uint32_t num_begin_render_pass;
     uint32_t num_begin_compute_pass;
     uint32_t num_set_pipeline;
+    uint32_t num_set_blend_constant;
+    uint32_t num_set_stencil_reference;
     sg_frame_stats_transfers transfers;
     sg_frame_stats_wgpu_uniforms uniforms;
     sg_frame_stats_wgpu_bindings bindings;
@@ -7167,6 +7169,11 @@ typedef struct {
     uint32_t timestamp_passes;
     _sg_wgpu_uniform_system_t uniform;
     _sg_wgpu_bindings_cache_t bindings_cache;
+    struct {
+        bool is_valid;
+        WGPUColor blend_color;
+        uint32_t stencil_ref;
+    } render_state_cache;
     _sg_wgpu_bindgroups_cache_t bindgroups_cache;
     _sg_wgpu_bindgroups_pool_t bindgroups_pool;
     _sg_wgpu_retirement_t retirement;
@@ -18315,6 +18322,7 @@ _SOKOL_PRIVATE void _sg_wgpu_discard_backend(void) {
 
 _SOKOL_PRIVATE void _sg_wgpu_reset_state_cache(void) {
     _sg_wgpu_bindings_cache_clear();
+    _sg.wgpu.render_state_cache.is_valid = false;
 }
 
 _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_buffer(_sg_buffer_t* buf, const sg_buffer_desc* desc) {
@@ -19115,7 +19123,7 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_pass(const sg_pass* pass, const _sg_attachmen
         SOKOL_ASSERT(_sg.wgpu.cmd_enc);
     }
 
-    _sg_wgpu_bindings_cache_clear();
+    _sg_wgpu_reset_state_cache();
     if (pass->compute) {
         _sg_wgpu_begin_compute_pass(pass);
     } else {
@@ -19206,8 +19214,22 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_pipeline(_sg_pipeline_t* pip) {
         SOKOL_ASSERT(_sg.wgpu.rpass_enc);
         wgpuRenderPassEncoderSetPipeline(_sg.wgpu.rpass_enc, pip->wgpu.rpip);
         _sg_stats_inc(wgpu.num_set_pipeline);
-        wgpuRenderPassEncoderSetBlendConstant(_sg.wgpu.rpass_enc, &pip->wgpu.blend_color);
-        wgpuRenderPassEncoderSetStencilReference(_sg.wgpu.rpass_enc, pip->cmn.stencil.ref);
+        // Pass-local dynamic state survives pipeline changes, but not native interop resets.
+        const WGPUColor* color = &pip->wgpu.blend_color;
+        const WGPUColor* cached = &_sg.wgpu.render_state_cache.blend_color;
+        if (!_sg.wgpu.render_state_cache.is_valid ||
+            color->r != cached->r || color->g != cached->g || color->b != cached->b || color->a != cached->a)
+        {
+            wgpuRenderPassEncoderSetBlendConstant(_sg.wgpu.rpass_enc, color);
+            _sg_stats_inc(wgpu.num_set_blend_constant);
+            _sg.wgpu.render_state_cache.blend_color = *color;
+        }
+        if (!_sg.wgpu.render_state_cache.is_valid || pip->cmn.stencil.ref != _sg.wgpu.render_state_cache.stencil_ref) {
+            wgpuRenderPassEncoderSetStencilReference(_sg.wgpu.rpass_enc, pip->cmn.stencil.ref);
+            _sg_stats_inc(wgpu.num_set_stencil_reference);
+            _sg.wgpu.render_state_cache.stencil_ref = pip->cmn.stencil.ref;
+        }
+        _sg.wgpu.render_state_cache.is_valid = true;
         if (shd->wgpu.bg_view_smp_empty) {
             wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, shd->wgpu.bg_view_smp_empty, 0, 0);
             _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
