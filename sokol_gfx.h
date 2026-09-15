@@ -4409,6 +4409,18 @@ typedef struct sg_wgpu_memory_stats {
     uint64_t bindgroup_cache_bytes;
     uint32_t bindgroups_alive;
     uint32_t bindgroups_capacity;
+    uint64_t retirement_queue_bytes;
+    uint64_t retired_buffer_bytes;
+    uint64_t retired_image_bytes;
+    uint64_t retired_unsubmitted_bytes; // subset waiting for the current encoder
+    uint64_t retired_bytes_peak; // event-driven since setup, including already submitted entries
+    uint64_t owned_buffers_created;
+    uint64_t owned_buffers_destroyed;
+    uint64_t owned_images_created;
+    uint64_t owned_images_destroyed;
+    uint32_t retired_count;
+    uint32_t retired_count_peak;
+    uint32_t retirement_capacity;
 } sg_wgpu_memory_stats;
 
 typedef struct sg_stats {
@@ -4497,6 +4509,7 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(METAL_CREATE_RPS_OUTPUT, "") \
     _SG_LOGITEM_XMACRO(METAL_CREATE_DSS_FAILED, "failed to create depth stencil state (metal)") \
     _SG_LOGITEM_XMACRO(METAL_CREATE_TEXTUREVIEW_FAILED, "failed to create texture view object (metal)") \
+    _SG_LOGITEM_XMACRO(WGPU_RETIREMENT_QUEUE_FULL, "owned-resource retirement queue full; commit or increase sg_desc.wgpu.retirement_queue_size") \
     _SG_LOGITEM_XMACRO(WGPU_BINDGROUPS_POOL_EXHAUSTED, "bindgroups pool exhausted (increase sg_desc.bindgroups_cache_size) (wgpu)") \
     _SG_LOGITEM_XMACRO(WGPU_BINDGROUPSCACHE_SIZE_GREATER_ONE, "sg_desc.wgpu.bindgroups_cache_size must be > 1 (wgpu)") \
     _SG_LOGITEM_XMACRO(WGPU_BINDGROUPSCACHE_SIZE_POW2, "sg_desc.wgpu.bindgroups_cache_size must be a power of 2 (wgpu)") \
@@ -5127,6 +5140,7 @@ typedef struct sg_metal_desc {
 typedef struct sg_wgpu_desc {
     bool disable_bindgroups_cache; // set to true to disable the WebGPU backend BindGroup cache
     int bindgroups_cache_size;     // number of slots in the WebGPU bindgroup cache (must be 2^N)
+    int retirement_queue_size;     // owned buffers/images awaiting Destroy; default: buffer + image pool sizes
 } sg_wgpu_desc;
 
 typedef struct sg_vulkan_desc {
@@ -5468,6 +5482,8 @@ SOKOL_GFX_API_DECL uint32_t sg_wgpu_frame_timestamp_passes(void);
 SOKOL_GFX_API_DECL const void* sg_wgpu_render_pass_encoder(void);
 // WebGPU: return WGPUComputePassEncoder of current pass (returns 0 when outside pass or in a render pass)
 SOKOL_GFX_API_DECL const void* sg_wgpu_compute_pass_encoder(void);
+// Native handles are borrowed: submit external uses before destroying their Sokol owner.
+// Current-frame encoder uses may finish at sg_commit. Longer-lived encoders/bundles require injected resources.
 // WebGPU: get internal buffer resource objects
 SOKOL_GFX_API_DECL sg_wgpu_buffer_info sg_wgpu_query_buffer_info(sg_buffer buf);
 // WebGPU: get internal image resource objects
@@ -6923,6 +6939,8 @@ typedef struct _sg_buffer_s {
     _sg_buffer_common_t cmn;
     struct {
         WGPUBuffer buf;
+        bool is_owned;
+        struct _sg_view_s* views;
     } wgpu;
 } _sg_wgpu_buffer_t;
 typedef _sg_wgpu_buffer_t _sg_buffer_t;
@@ -6932,6 +6950,8 @@ typedef struct _sg_image_s {
     _sg_image_common_t cmn;
     struct {
         WGPUTexture tex;
+        bool is_owned;
+        struct _sg_view_s* views;
     } wgpu;
 } _sg_wgpu_image_t;
 typedef _sg_wgpu_image_t _sg_image_t;
@@ -6989,6 +7009,8 @@ typedef struct _sg_view_s {
     _sg_view_common_t cmn;
     struct {
         WGPUTextureView view;
+        struct _sg_view_s* prev;
+        struct _sg_view_s* next;
     } wgpu;
 } _sg_wgpu_view_t;
 typedef _sg_wgpu_view_t _sg_view_t;
@@ -7070,6 +7092,22 @@ typedef struct {
     _sg_wgpu_bindgroup_handle_t bg;
 } _sg_wgpu_bindings_cache_t;
 
+// Retain the original native handle until its final submit, independent of public slot reuse.
+#define _SG_WGPU_RETIREMENT_BATCH (64)
+typedef struct {
+    WGPUBuffer buffer;
+    WGPUTexture image;
+    uint64_t bytes;
+    uint64_t after_submit;
+} _sg_wgpu_retired_t;
+
+typedef struct {
+    _sg_wgpu_retired_t* items;
+    uint32_t head;
+    uint64_t submit_index;
+    sg_wgpu_memory_stats stats;
+} _sg_wgpu_retirement_t;
+
 // the WGPU backend state
 typedef struct {
     bool valid;
@@ -7085,6 +7123,7 @@ typedef struct {
     _sg_wgpu_bindings_cache_t bindings_cache;
     _sg_wgpu_bindgroups_cache_t bindgroups_cache;
     _sg_wgpu_bindgroups_pool_t bindgroups_pool;
+    _sg_wgpu_retirement_t retirement;
 } _sg_wgpu_backend_t;
 
 #elif defined(SOKOL_VULKAN)
@@ -17452,6 +17491,7 @@ _SOKOL_PRIVATE void _sg_wgpu_uniform_system_init(const sg_desc* desc) {
 
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_discard(void) {
     if (_sg.wgpu.uniform.buf) {
+        wgpuBufferDestroy(_sg.wgpu.uniform.buf);
         wgpuBufferRelease(_sg.wgpu.uniform.buf);
         _sg.wgpu.uniform.buf = 0;
     }
@@ -17806,6 +17846,9 @@ _SOKOL_PRIVATE _sg_wgpu_bindgroup_t* _sg_wgpu_create_bindgroup(_sg_bindings_ptrs
 _SOKOL_PRIVATE void _sg_wgpu_discard_bindgroup(_sg_wgpu_bindgroup_t* bg) {
     SOKOL_ASSERT(bg);
     if (bg->slot.state == SG_RESOURCESTATE_VALID) {
+        if (_sg.wgpu.bindings_cache.bg.id == bg->slot.id) {
+            _sg.wgpu.bindings_cache.bg.id = SG_INVALID_ID;
+        }
         if (bg->bindgroup) {
             wgpuBindGroupRelease(bg->bindgroup);
             _sg_stats_inc(wgpu.bindings.num_discard_bindgroup);
@@ -18085,6 +18128,115 @@ _SOKOL_PRIVATE bool _sg_wgpu_apply_vertex_buffers(_sg_bindings_ptrs_t* bnd) {
     return true;
 }
 
+_SOKOL_PRIVATE void _sg_wgpu_retirement_init(const sg_desc* desc) {
+    _sg_wgpu_retirement_t* q = &_sg.wgpu.retirement;
+    SOKOL_ASSERT(desc->wgpu.retirement_queue_size > 0 && desc->wgpu.retirement_queue_size <= 2 * _SG_MAX_POOL_SIZE && !q->items);
+    q->stats.retirement_capacity = (uint32_t)desc->wgpu.retirement_queue_size;
+    q->stats.retirement_queue_bytes = (uint64_t)q->stats.retirement_capacity * sizeof(*q->items);
+    q->items = (_sg_wgpu_retired_t*)_sg_malloc_clear((size_t)q->stats.retirement_queue_bytes);
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_retirement_drain(uint32_t budget) {
+    _sg_wgpu_retirement_t* q = &_sg.wgpu.retirement;
+    while (budget-- > 0 && q->stats.retired_count > 0) {
+        _sg_wgpu_retired_t* item = &q->items[q->head];
+        if (item->after_submit > q->submit_index) {
+            break;
+        }
+        if (item->buffer) {
+            wgpuBufferDestroy(item->buffer);
+            wgpuBufferRelease(item->buffer);
+            q->stats.retired_buffer_bytes -= item->bytes;
+            q->stats.owned_buffers_destroyed++;
+        } else {
+            SOKOL_ASSERT(item->image);
+            wgpuTextureDestroy(item->image);
+            wgpuTextureRelease(item->image);
+            q->stats.retired_image_bytes -= item->bytes;
+            q->stats.owned_images_destroyed++;
+        }
+        _sg_clear(item, sizeof(*item));
+        q->head = (q->head + 1) % q->stats.retirement_capacity;
+        q->stats.retired_count--;
+    }
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_retire(WGPUBuffer buffer, WGPUTexture image, uint64_t bytes) {
+    _sg_wgpu_retirement_t* q = &_sg.wgpu.retirement;
+    SOKOL_ASSERT((buffer != 0) != (image != 0));
+    // One ready entry per admission prevents previous submitted batches occupying all slots.
+    _sg_wgpu_retirement_drain(1);
+    if (q->stats.retired_count == q->stats.retirement_capacity) {
+        _SG_PANIC(WGPU_RETIREMENT_QUEUE_FULL);
+        abort();
+    }
+    const uint32_t tail = (q->head + q->stats.retired_count) % q->stats.retirement_capacity;
+    q->items[tail].buffer = buffer;
+    q->items[tail].image = image;
+    q->items[tail].bytes = bytes;
+    q->items[tail].after_submit = q->submit_index + (_sg.wgpu.cmd_enc ? 1 : 0);
+    q->stats.retired_count++;
+    if (_sg.wgpu.cmd_enc) { q->stats.retired_unsubmitted_bytes += bytes; }
+    if (buffer) { q->stats.retired_buffer_bytes += bytes; }
+    else { q->stats.retired_image_bytes += bytes; }
+    const uint64_t total = q->stats.retired_buffer_bytes + q->stats.retired_image_bytes;
+    if (total > q->stats.retired_bytes_peak) { q->stats.retired_bytes_peak = total; }
+    if (q->stats.retired_count > q->stats.retired_count_peak) { q->stats.retired_count_peak = q->stats.retired_count; }
+}
+
+_SOKOL_PRIVATE uint64_t _sg_wgpu_image_bytes(const _sg_image_t* img) {
+    uint64_t bytes = 0;
+    for (int mip = 0; mip < img->cmn.num_mipmaps; mip++) {
+        const int w = _sg_miplevel_dim(img->cmn.width, mip);
+        const int h = _sg_miplevel_dim(img->cmn.height, mip);
+        const int slices = img->cmn.type == SG_IMAGETYPE_3D ? _sg_miplevel_dim(img->cmn.num_slices, mip) : img->cmn.num_slices;
+        bytes += (uint64_t)_sg_row_pitch(img->cmn.pixel_format, w, 1) * (uint64_t)_sg_num_rows(img->cmn.pixel_format, h) * (uint64_t)slices * (uint64_t)img->cmn.sample_count;
+    }
+    return bytes;
+}
+
+_SOKOL_PRIVATE _sg_view_t** _sg_wgpu_view_head(_sg_view_t* view) {
+    if (view->cmn.type == SG_VIEWTYPE_STORAGEBUFFER) {
+        return _sg_buffer_ref_valid(&view->cmn.buf.ref) ? &view->cmn.buf.ref.ptr->wgpu.views : 0;
+    }
+    return _sg_image_ref_valid(&view->cmn.img.ref) ? &view->cmn.img.ref.ptr->wgpu.views : 0;
+}
+
+_SOKOL_PRIVATE bool _sg_wgpu_unlink_view(_sg_view_t* view) {
+    _sg_view_t** head = _sg_wgpu_view_head(view);
+    const bool is_linked = head && (view->wgpu.prev || *head == view);
+    if (is_linked) {
+        if (view->wgpu.prev) { view->wgpu.prev->wgpu.next = view->wgpu.next; }
+        else if (*head == view) { *head = view->wgpu.next; }
+        if (view->wgpu.next) { view->wgpu.next->wgpu.prev = view->wgpu.prev; }
+    }
+    view->wgpu.prev = view->wgpu.next = 0;
+    return is_linked;
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_invalidate_resource_views(_sg_view_t** head) {
+    while (*head) {
+        _sg_view_t* view = *head;
+        _sg_wgpu_bindgroups_cache_invalidate(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_VIEW, &view->slot);
+        _sg_wgpu_unlink_view(view);
+    }
+}
+
+// Shutdown abandons unsubmitted work before destroying resources. It never waits on the device.
+_SOKOL_PRIVATE void _sg_wgpu_abandon_commands(void) {
+    if (_sg.wgpu.rpass_enc) {
+        wgpuRenderPassEncoderRelease(_sg.wgpu.rpass_enc); _sg.wgpu.rpass_enc = 0;
+    }
+    if (_sg.wgpu.cpass_enc) {
+        wgpuComputePassEncoderRelease(_sg.wgpu.cpass_enc); _sg.wgpu.cpass_enc = 0;
+    }
+    if (_sg.wgpu.cmd_enc) {
+        wgpuCommandEncoderRelease(_sg.wgpu.cmd_enc); _sg.wgpu.cmd_enc = 0;
+    }
+    _sg.wgpu.retirement.submit_index++;
+    _sg.wgpu.retirement.stats.retired_unsubmitted_bytes = 0;
+}
+
 _SOKOL_PRIVATE void _sg_wgpu_setup_backend(const sg_desc* desc) {
     SOKOL_ASSERT(desc);
     SOKOL_ASSERT(desc->environment.wgpu.device);
@@ -18099,6 +18251,7 @@ _SOKOL_PRIVATE void _sg_wgpu_setup_backend(const sg_desc* desc) {
     _sg_wgpu_bindgroups_pool_init(desc);
     _sg_wgpu_bindgroups_cache_init(desc);
     _sg_wgpu_bindings_cache_clear();
+    _sg_wgpu_retirement_init(desc);
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_discard_backend(void) {
@@ -18108,10 +18261,9 @@ _SOKOL_PRIVATE void _sg_wgpu_discard_backend(void) {
     _sg_wgpu_bindgroups_cache_discard();
     _sg_wgpu_bindgroups_pool_discard();
     _sg_wgpu_uniform_system_discard();
-    // the command encoder is usually released in sg_commit()
-    if (_sg.wgpu.cmd_enc) {
-        wgpuCommandEncoderRelease(_sg.wgpu.cmd_enc); _sg.wgpu.cmd_enc = 0;
-    }
+    _sg_wgpu_retirement_drain(_sg.wgpu.retirement.stats.retirement_capacity);
+    SOKOL_ASSERT(_sg.wgpu.retirement.stats.retired_count == 0);
+    _sg_free(_sg.wgpu.retirement.items); _sg.wgpu.retirement.items = 0;
     wgpuQueueRelease(_sg.wgpu.queue); _sg.wgpu.queue = 0;
 }
 
@@ -18142,6 +18294,8 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_buffer(_sg_buffer_t* buf, const
             _SG_ERROR(WGPU_CREATE_BUFFER_FAILED);
             return SG_RESOURCESTATE_FAILED;
         }
+        buf->wgpu.is_owned = true;
+        _sg.wgpu.retirement.stats.owned_buffers_created++;
         if (map_at_creation) {
             SOKOL_ASSERT(desc->data.ptr && (desc->data.size > 0));
             SOKOL_ASSERT(desc->data.size <= (size_t)buf->cmn.size);
@@ -18159,7 +18313,21 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_buffer(_sg_buffer_t* buf, const
 _SOKOL_PRIVATE void _sg_wgpu_discard_buffer(_sg_buffer_t* buf) {
     SOKOL_ASSERT(buf);
     if (buf->wgpu.buf) {
-        wgpuBufferRelease(buf->wgpu.buf);
+        _sg_wgpu_invalidate_resource_views(&buf->wgpu.views);
+        for (size_t i = 0; i < SG_MAX_VERTEXBUFFER_BINDSLOTS; i++) {
+            if (_sg.wgpu.bindings_cache.vbs[i].buffer.id == buf->slot.id) {
+                _sg_wgpu_bindings_cache_vb_update(i, 0, 0);
+            }
+        }
+        if (_sg.wgpu.bindings_cache.ib.buffer.id == buf->slot.id) {
+            _sg_wgpu_bindings_cache_ib_update(0, 0, WGPUIndexFormat_Undefined);
+        }
+        if (buf->wgpu.is_owned) {
+            _sg_wgpu_retire(buf->wgpu.buf, 0, _sg_roundup_u64((uint64_t)buf->cmn.size, 4));
+        } else {
+            wgpuBufferRelease(buf->wgpu.buf);
+        }
+        buf->wgpu.buf = 0;
     }
 }
 
@@ -18246,6 +18414,8 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_image(_sg_image_t* img, const s
             _SG_ERROR(WGPU_CREATE_TEXTURE_FAILED);
             return SG_RESOURCESTATE_FAILED;
         }
+        img->wgpu.is_owned = true;
+        _sg.wgpu.retirement.stats.owned_images_created++;
         if (desc->data.mip_levels[0].ptr) {
             _sg_wgpu_copy_image_data(img, &desc->data);
         }
@@ -18256,7 +18426,12 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_image(_sg_image_t* img, const s
 _SOKOL_PRIVATE void _sg_wgpu_discard_image(_sg_image_t* img) {
     SOKOL_ASSERT(img);
     if (img->wgpu.tex) {
-        wgpuTextureRelease(img->wgpu.tex);
+        _sg_wgpu_invalidate_resource_views(&img->wgpu.views);
+        if (img->wgpu.is_owned) {
+            _sg_wgpu_retire(0, img->wgpu.tex, _sg_wgpu_image_bytes(img));
+        } else {
+            wgpuTextureRelease(img->wgpu.tex);
+        }
         img->wgpu.tex = 0;
     }
 }
@@ -18759,12 +18934,19 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_view(_sg_view_t* view, const sg
             return SG_RESOURCESTATE_FAILED;
         }
     }
+    _sg_view_t** head = _sg_wgpu_view_head(view);
+    SOKOL_ASSERT(head);
+    view->wgpu.next = *head;
+    if (*head) { (*head)->wgpu.prev = view; }
+    *head = view;
     return SG_RESOURCESTATE_VALID;
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_discard_view(_sg_view_t* view) {
     SOKOL_ASSERT(view);
-    _sg_wgpu_bindgroups_cache_invalidate(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_VIEW, &view->slot);
+    if (_sg_wgpu_unlink_view(view)) {
+        _sg_wgpu_bindgroups_cache_invalidate(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_VIEW, &view->slot);
+    }
     if (view->wgpu.view) {
         wgpuTextureViewRelease(view->wgpu.view);
         view->wgpu.view = 0;
@@ -18913,7 +19095,8 @@ _SOKOL_PRIVATE void _sg_wgpu_commit(void) {
     _sg.wgpu.timestamp_query = 0;
     _sg.wgpu.timestamp_passes = 0;
     if (!_sg.wgpu.cmd_enc) {
-        // no valid pass in this frame
+        // No pass still services previously submitted or never-encoded retirements.
+        _sg_wgpu_retirement_drain(_SG_WGPU_RETIREMENT_BATCH);
         return;
     }
     _sg_wgpu_uniform_system_on_commit();
@@ -18925,6 +19108,9 @@ _SOKOL_PRIVATE void _sg_wgpu_commit(void) {
     wgpuQueueSubmit(_sg.wgpu.queue, 1, &wgpu_cmd_buf);
     _sg_stats_inc(wgpu.transfers.num_queue_submit);
     wgpuCommandBufferRelease(wgpu_cmd_buf);
+    _sg.wgpu.retirement.submit_index++;
+    _sg.wgpu.retirement.stats.retired_unsubmitted_bytes = 0;
+    _sg_wgpu_retirement_drain(_SG_WGPU_RETIREMENT_BATCH);
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_apply_viewport(int x, int y, int w, int h, bool origin_top_left) {
@@ -24935,6 +25121,7 @@ _SOKOL_PRIVATE sg_desc _sg_desc_defaults(const sg_desc* desc) {
     res.environment.defaults.sample_count = _sg_def(res.environment.defaults.sample_count, 1);
     res.buffer_pool_size = _sg_def(res.buffer_pool_size, _SG_DEFAULT_BUFFER_POOL_SIZE);
     res.image_pool_size = _sg_def(res.image_pool_size, _SG_DEFAULT_IMAGE_POOL_SIZE);
+    res.wgpu.retirement_queue_size = _sg_def(res.wgpu.retirement_queue_size, res.buffer_pool_size + res.image_pool_size);
     res.sampler_pool_size = _sg_def(res.sampler_pool_size, _SG_DEFAULT_SAMPLER_POOL_SIZE);
     res.shader_pool_size = _sg_def(res.shader_pool_size, _SG_DEFAULT_SHADER_POOL_SIZE);
     res.pipeline_pool_size = _sg_def(res.pipeline_pool_size, _SG_DEFAULT_PIPELINE_POOL_SIZE);
@@ -25044,6 +25231,9 @@ SOKOL_API_IMPL void sg_setup(const sg_desc* desc) {
 
 SOKOL_API_IMPL void sg_shutdown(void) {
     SOKOL_ASSERT(_sg.valid);
+    #if defined(SOKOL_WGPU)
+    _sg_wgpu_abandon_commands();
+    #endif
     _sg_discard_all_resources();
     _sg_discard_backend();
     _sg_discard_commit_listeners();
@@ -25123,6 +25313,7 @@ SOKOL_API_IMPL sg_stats sg_query_stats(void) {
     #if defined(SOKOL_WGPU)
         const _sg_wgpu_uniform_system_t* u = &_sg.wgpu.uniform;
         const _sg_pool_t* p = &_sg.wgpu.bindgroups_pool.pool;
+        _sg.stats.wgpu_memory = _sg.wgpu.retirement.stats;
         _sg.stats.wgpu_memory.uniform_gpu_bytes = u->buf ? u->num_bytes : 0;
         _sg.stats.wgpu_memory.uniform_staging_bytes = u->staging ? u->num_bytes : 0;
         _sg.stats.wgpu_memory.uniform_profiling_bytes = (uint64_t)u->max_records * sizeof(*u->records);
