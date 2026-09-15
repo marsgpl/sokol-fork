@@ -2052,6 +2052,7 @@ typedef struct sapp_desc {
     bool high_dpi;                      // whether the rendering canvas is full-resolution on HighDPI displays
     bool fullscreen;                    // whether the window should be created in fullscreen mode
     bool alpha;                         // whether the framebuffer should have an alpha channel (ignored on some platforms)
+    bool enable_timestamp_query;        // Slopa: request optional WebGPU timestamps for profiling
     const char* window_title;           // the window title as UTF-8 encoded string
     bool enable_clipboard;              // enable clipboard access, default is false
     int clipboard_size;                 // max size of clipboard content in bytes
@@ -4130,6 +4131,10 @@ _SOKOL_PRIVATE void _sapp_wgpu_create_device_and_swapchain(void) {
     // for offscreen targets
     if (wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_Depth32FloatStencil8)) {
         requiredFeatures[cur_feature_index++] = WGPUFeatureName_Depth32FloatStencil8;
+    }
+    if (_sapp.desc.enable_timestamp_query && wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_TimestampQuery)) {
+        SOKOL_ASSERT(cur_feature_index < _SAPP_WGPU_MAX_REQUESTED_FEATURES);
+        requiredFeatures[cur_feature_index++] = WGPUFeatureName_TimestampQuery;
     }
     if (wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_TextureCompressionBC)) {
         SOKOL_ASSERT(cur_feature_index < _SAPP_WGPU_MAX_REQUESTED_FEATURES);

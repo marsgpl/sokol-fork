@@ -4281,6 +4281,7 @@ typedef struct sg_frame_stats_metal {
 typedef struct sg_frame_stats_wgpu_uniforms {
     uint32_t num_set_bindgroup;
     uint32_t size_write_buffer;
+    uint32_t size_copy; // payload copied into the uniform ring, before alignment
 } sg_frame_stats_wgpu_uniforms;
 
 typedef struct sg_frame_stats_wgpu_bindings {
@@ -4299,7 +4300,25 @@ typedef struct sg_frame_stats_wgpu_bindings {
     uint32_t num_bindgroup_cache_hash_vs_key_mismatch;
 } sg_frame_stats_wgpu_bindings;
 
+// Slopa: explicit native transfers, including caller-owned helpers via sg_add_transfer_stats.
+// Metal helper memcpy is reported separately; WebGPU sizes are submitted bytes.
+typedef struct sg_frame_stats_transfers {
+    uint32_t num_write_buffer;
+    uint32_t num_write_texture;
+    uint32_t num_copy_buffer;
+    uint32_t num_queue_submit;
+    uint64_t size_write_buffer;
+    uint64_t size_write_texture;
+    uint64_t size_write_padding;
+    uint64_t size_copy_buffer;
+    uint64_t size_memcpy;
+} sg_frame_stats_transfers;
+
 typedef struct sg_frame_stats_wgpu {
+    uint32_t num_begin_render_pass;
+    uint32_t num_begin_compute_pass;
+    uint32_t num_set_pipeline;
+    sg_frame_stats_transfers transfers;
     sg_frame_stats_wgpu_uniforms uniforms;
     sg_frame_stats_wgpu_bindings bindings;
 } sg_frame_stats_wgpu;
@@ -4370,6 +4389,7 @@ typedef struct sg_frame_stats {
     sg_frame_resource_stats shaders;
     sg_frame_resource_stats pipelines;
 
+    sg_frame_stats_transfers external_transfers; // Slopa native helpers, separate from backend totals
     sg_frame_stats_gl gl;
     sg_frame_stats_d3d11 d3d11;
     sg_frame_stats_metal metal;
@@ -5254,6 +5274,8 @@ SOKOL_GFX_API_DECL void sg_enable_stats(void);
 SOKOL_GFX_API_DECL void sg_disable_stats(void);
 SOKOL_GFX_API_DECL bool sg_stats_enabled(void);
 SOKOL_GFX_API_DECL sg_stats sg_query_stats(void);
+// Slopa: renderer-thread native helpers join the current frame; ignored while stats are disabled.
+SOKOL_GFX_API_DECL void sg_add_transfer_stats(const sg_frame_stats_transfers* stats);
 
 /* Backend-specific structs and functions, these may come in handy for mixing
    sokol-gfx rendering with 'native backend' rendering functions.
@@ -5422,6 +5444,10 @@ SOKOL_GFX_API_DECL const void* sg_wgpu_device(void);
 SOKOL_GFX_API_DECL const void* sg_wgpu_queue(void);
 // WebGPU: return this frame's WGPUCommandEncoder
 SOKOL_GFX_API_DECL const void* sg_wgpu_command_encoder(void);
+// Slopa: borrow a two-slot timestamp query set until commit. Arm before the first pass.
+// Query 0 marks the first pass start; query 1 is overwritten at each pass end.
+SOKOL_GFX_API_DECL void sg_wgpu_arm_frame_timestamps(const void* query_set);
+SOKOL_GFX_API_DECL uint32_t sg_wgpu_frame_timestamp_passes(void);
 // WebGPU: return WGPURenderPassEncoder of current pass (returns 0 when outside pass or in a compute pass)
 SOKOL_GFX_API_DECL const void* sg_wgpu_render_pass_encoder(void);
 // WebGPU: return WGPUComputePassEncoder of current pass (returns 0 when outside pass or in a render pass)
@@ -7024,6 +7050,8 @@ typedef struct {
     WGPUCommandEncoder cmd_enc;
     WGPURenderPassEncoder rpass_enc;
     WGPUComputePassEncoder cpass_enc;
+    WGPUQuerySet timestamp_query;
+    uint32_t timestamp_passes;
     _sg_wgpu_uniform_system_t uniform;
     _sg_wgpu_bindings_cache_t bindings_cache;
     _sg_wgpu_bindgroups_cache_t bindgroups_cache;
@@ -17401,6 +17429,7 @@ _SOKOL_PRIVATE void _sg_wgpu_uniform_system_discard(void) {
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_set_bindgroup(void) {
     SOKOL_ASSERT(_sg.wgpu.uniform.dirty);
     _sg.wgpu.uniform.dirty = false;
+    _sg_stats_inc(wgpu.uniforms.num_set_bindgroup);
     const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
     // NOTE: dynamic offsets must be in binding order, not in BindGroupEntry order
@@ -17443,6 +17472,8 @@ _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_apply_pipeline(void) {
 
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_commit(void) {
     wgpuQueueWriteBuffer(_sg.wgpu.queue, _sg.wgpu.uniform.buf, 0, _sg.wgpu.uniform.staging, _sg.wgpu.uniform.offset);
+    _sg_stats_inc(wgpu.transfers.num_write_buffer);
+    _sg_stats_add(wgpu.transfers.size_write_buffer, _sg.wgpu.uniform.offset);
     _sg_stats_add(wgpu.uniforms.size_write_buffer, _sg.wgpu.uniform.offset);
     _sg.wgpu.uniform.offset = 0;
     _sg_clear(_sg.wgpu.uniform.bind_offsets, sizeof(_sg.wgpu.uniform.bind_offsets));
@@ -17620,7 +17651,6 @@ _SOKOL_PRIVATE _sg_wgpu_bindgroup_t* _sg_wgpu_create_bindgroup(_sg_bindings_ptrs
     SOKOL_ASSERT(_sg.wgpu.dev);
     SOKOL_ASSERT(bnd->pip);
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&bnd->pip->cmn.shader);
-    _sg_stats_inc(wgpu.bindings.num_create_bindgroup);
     _sg_wgpu_bindgroup_handle_t bg_id = _sg_wgpu_alloc_bindgroup();
     if (bg_id.id == SG_INVALID_ID) {
         return 0;
@@ -17671,6 +17701,7 @@ _SOKOL_PRIVATE _sg_wgpu_bindgroup_t* _sg_wgpu_create_bindgroup(_sg_bindings_ptrs
     bg_desc.entryCount = bgl_index;
     bg_desc.entries = bg_entries;
     bg->bindgroup = wgpuDeviceCreateBindGroup(_sg.wgpu.dev, &bg_desc);
+    _sg_stats_inc(wgpu.bindings.num_create_bindgroup);
     if (bg->bindgroup == 0) {
         _SG_ERROR(WGPU_CREATEBINDGROUP_FAILED);
         bg->slot.state = SG_RESOURCESTATE_FAILED;
@@ -17683,10 +17714,10 @@ _SOKOL_PRIVATE _sg_wgpu_bindgroup_t* _sg_wgpu_create_bindgroup(_sg_bindings_ptrs
 
 _SOKOL_PRIVATE void _sg_wgpu_discard_bindgroup(_sg_wgpu_bindgroup_t* bg) {
     SOKOL_ASSERT(bg);
-    _sg_stats_inc(wgpu.bindings.num_discard_bindgroup);
     if (bg->slot.state == SG_RESOURCESTATE_VALID) {
         if (bg->bindgroup) {
             wgpuBindGroupRelease(bg->bindgroup);
+            _sg_stats_inc(wgpu.bindings.num_discard_bindgroup);
             bg->bindgroup = 0;
         }
         _sg_wgpu_reset_bindgroup_to_alloc_state(bg);
@@ -18024,6 +18055,7 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_buffer(_sg_buffer_t* buf, const
             void* ptr = wgpuBufferGetMappedRange(buf->wgpu.buf, 0, wgpu_buf_size);
             SOKOL_ASSERT(ptr);
             memcpy(ptr, desc->data.ptr, desc->data.size);
+            _sg_stats_add(wgpu.transfers.size_memcpy, desc->data.size);
             wgpuBufferUnmap(buf->wgpu.buf);
         }
     }
@@ -18045,6 +18077,8 @@ _SOKOL_PRIVATE void _sg_wgpu_copy_buffer_data(const _sg_buffer_t* buf, uint64_t 
     uint64_t extra_size = data->size & 3UL;
     SOKOL_ASSERT(extra_size < 4);
     wgpuQueueWriteBuffer(_sg.wgpu.queue, buf->wgpu.buf, offset, data->ptr, clamped_size);
+    _sg_stats_inc(wgpu.transfers.num_write_buffer);
+    _sg_stats_add(wgpu.transfers.size_write_buffer, clamped_size);
     if (extra_size > 0) {
         const uint64_t extra_src_offset = clamped_size;
         const uint64_t extra_dst_offset = offset + clamped_size;
@@ -18054,6 +18088,10 @@ _SOKOL_PRIVATE void _sg_wgpu_copy_buffer_data(const _sg_buffer_t* buf, uint64_t 
             extra_data[i] = extra_src_ptr[i];
         }
         wgpuQueueWriteBuffer(_sg.wgpu.queue, buf->wgpu.buf, extra_dst_offset, extra_data, 4);
+        _sg_stats_inc(wgpu.transfers.num_write_buffer);
+        _sg_stats_add(wgpu.transfers.size_write_buffer, 4);
+        _sg_stats_add(wgpu.transfers.size_write_padding, 4 - extra_size);
+        _sg_stats_add(wgpu.transfers.size_memcpy, extra_size);
     }
 }
 
@@ -18081,6 +18119,8 @@ _SOKOL_PRIVATE void _sg_wgpu_copy_image_data(const _sg_image_t* img, const sg_im
         wgpu_extent.depthOrArrayLayers = (uint32_t)mip_slices;
         const sg_range* mip_data = &data->mip_levels[mip_index];
         wgpuQueueWriteTexture(_sg.wgpu.queue, &wgpu_copy_tex, mip_data->ptr, mip_data->size, &wgpu_layout, &wgpu_extent);
+        _sg_stats_inc(wgpu.transfers.num_write_texture);
+        _sg_stats_add(wgpu.transfers.size_write_texture, mip_data->size);
     }
 }
 
@@ -18329,6 +18369,7 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_shader(_sg_shader_t* shd, const
     bg_desc.entryCount = bgl_index;
     bg_desc.entries = bg_entries;
     shd->wgpu.bg_ub = wgpuDeviceCreateBindGroup(_sg.wgpu.dev, &bg_desc);
+    _sg_stats_inc(wgpu.bindings.num_create_bindgroup);
     SOKOL_ASSERT(shd->wgpu.bg_ub);
 
     // sort the dynoffset_map by wgpu bindings, this is because the
@@ -18405,6 +18446,7 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_shader(_sg_shader_t* shd, const
         _sg_clear(&bg_desc, sizeof(bg_desc));
         bg_desc.layout = shd->wgpu.bgl_view_smp;
         shd->wgpu.bg_view_smp_empty = wgpuDeviceCreateBindGroup(_sg.wgpu.dev, &bg_desc);
+        _sg_stats_inc(wgpu.bindings.num_create_bindgroup);
         SOKOL_ASSERT(shd->wgpu.bg_view_smp_empty);
     }
     return SG_RESOURCESTATE_VALID;
@@ -18421,6 +18463,7 @@ _SOKOL_PRIVATE void _sg_wgpu_discard_shader(_sg_shader_t* shd) {
     }
     if (shd->wgpu.bg_ub) {
         wgpuBindGroupRelease(shd->wgpu.bg_ub);
+        _sg_stats_inc(wgpu.bindings.num_discard_bindgroup);
         shd->wgpu.bg_ub = 0;
     }
     if (shd->wgpu.bgl_view_smp) {
@@ -18430,6 +18473,7 @@ _SOKOL_PRIVATE void _sg_wgpu_discard_shader(_sg_shader_t* shd) {
     // patch(slopa): safari empty-bindgroup fix, see game/README.md
     if (shd->wgpu.bg_view_smp_empty) {
         wgpuBindGroupRelease(shd->wgpu.bg_view_smp_empty);
+        _sg_stats_inc(wgpu.bindings.num_discard_bindgroup);
         shd->wgpu.bg_view_smp_empty = 0;
     }
 }
@@ -18662,15 +18706,29 @@ _SOKOL_PRIVATE void _sg_wgpu_init_ds_att(WGPURenderPassDepthStencilAttachment* w
     wgpu_att->stencilReadOnly = false;
 }
 
+_SOKOL_PRIVATE WGPUPassTimestampWrites _sg_wgpu_pass_timestamps(void) {
+    WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+    writes.querySet = _sg.wgpu.timestamp_query;
+    if (writes.querySet) {
+        if (_sg.wgpu.timestamp_passes++ == 0) {
+            writes.beginningOfPassWriteIndex = 0;
+        }
+        writes.endOfPassWriteIndex = 1;
+    }
+    return writes;
+}
+
 _SOKOL_PRIVATE void _sg_wgpu_begin_compute_pass(const sg_pass* pass) {
     _SG_STRUCT(WGPUComputePassDescriptor, wgpu_pass_desc);
     wgpu_pass_desc.label = _sg_wgpu_stringview(pass->label);
+    WGPUPassTimestampWrites timestamps = _sg_wgpu_pass_timestamps();
+    wgpu_pass_desc.timestampWrites = timestamps.querySet ? &timestamps : 0;
     _sg.wgpu.cpass_enc = wgpuCommandEncoderBeginComputePass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
+    _sg_stats_inc(wgpu.num_begin_compute_pass);
     SOKOL_ASSERT(_sg.wgpu.cpass_enc);
     // patch(slopa): the two null "clear initial bindings" setBindGroup calls
     // are dropped, safari rejects a null bind group (see game/README.md).
     // _sg_wgpu_begin_pass already cleared the bindings cache
-    _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_begin_render_pass(const sg_pass* pass, const _sg_attachments_ptrs_t* atts) {
@@ -18714,10 +18772,12 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_render_pass(const sg_pass* pass, const _sg_at
             wgpu_pass_desc.depthStencilAttachment = &wgpu_ds_att;
         }
     }
+    WGPUPassTimestampWrites timestamps = _sg_wgpu_pass_timestamps();
+    wgpu_pass_desc.timestampWrites = timestamps.querySet ? &timestamps : 0;
     _sg.wgpu.rpass_enc = wgpuCommandEncoderBeginRenderPass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
+    _sg_stats_inc(wgpu.num_begin_render_pass);
     SOKOL_ASSERT(_sg.wgpu.rpass_enc);
 
-    _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_begin_pass(const sg_pass* pass, const _sg_attachments_ptrs_t* atts) {
@@ -18756,6 +18816,8 @@ _SOKOL_PRIVATE void _sg_wgpu_end_pass(const _sg_attachments_ptrs_t* atts) {
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_commit(void) {
+    _sg.wgpu.timestamp_query = 0;
+    _sg.wgpu.timestamp_passes = 0;
     if (!_sg.wgpu.cmd_enc) {
         // no valid pass in this frame
         return;
@@ -18767,6 +18829,7 @@ _SOKOL_PRIVATE void _sg_wgpu_commit(void) {
     wgpuCommandEncoderRelease(_sg.wgpu.cmd_enc);
     _sg.wgpu.cmd_enc = 0;
     wgpuQueueSubmit(_sg.wgpu.queue, 1, &wgpu_cmd_buf);
+    _sg_stats_inc(wgpu.transfers.num_queue_submit);
     wgpuCommandBufferRelease(wgpu_cmd_buf);
 }
 
@@ -18801,8 +18864,10 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_pipeline(_sg_pipeline_t* pip) {
         SOKOL_ASSERT(pip->wgpu.cpip);
         SOKOL_ASSERT(_sg.wgpu.cpass_enc);
         wgpuComputePassEncoderSetPipeline(_sg.wgpu.cpass_enc, pip->wgpu.cpip);
+        _sg_stats_inc(wgpu.num_set_pipeline);
         if (shd->wgpu.bg_view_smp_empty) {
             wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, shd->wgpu.bg_view_smp_empty, 0, 0);
+            _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
             // the raw bind above bypasses _sg_wgpu_set_bindgroup, so drop its
             // redundancy cache or the next sg_apply_bindings with the
             // previously bound group gets skipped while the empty group is
@@ -18814,10 +18879,12 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_pipeline(_sg_pipeline_t* pip) {
         SOKOL_ASSERT(pip->wgpu.rpip);
         SOKOL_ASSERT(_sg.wgpu.rpass_enc);
         wgpuRenderPassEncoderSetPipeline(_sg.wgpu.rpass_enc, pip->wgpu.rpip);
+        _sg_stats_inc(wgpu.num_set_pipeline);
         wgpuRenderPassEncoderSetBlendConstant(_sg.wgpu.rpass_enc, &pip->wgpu.blend_color);
         wgpuRenderPassEncoderSetStencilReference(_sg.wgpu.rpass_enc, pip->cmn.stencil.ref);
         if (shd->wgpu.bg_view_smp_empty) {
             wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, shd->wgpu.bg_view_smp_empty, 0, 0);
+            _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
             // see compute branch above: keep the redundancy cache honest
             _sg_wgpu_bindings_cache_bg_update(0);
         }
@@ -18843,8 +18910,10 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_uniforms(int ub_slot, const sg_range* data) {
     SOKOL_ASSERT((_sg.wgpu.uniform.offset & (alignment - 1)) == 0);
     SOKOL_ASSERT(data->size <= _SG_WGPU_MAX_UNIFORM_UPDATE_SIZE);
 
-    _sg_stats_inc(wgpu.uniforms.num_set_bindgroup);
     memcpy(_sg.wgpu.uniform.staging + _sg.wgpu.uniform.offset, data->ptr, data->size);
+    _sg_stats_add(wgpu.uniforms.size_copy, (uint32_t)data->size);
+    _sg_stats_add(wgpu.transfers.size_write_padding, _sg_roundup_u32((uint32_t)data->size, alignment) - data->size);
+    _sg_stats_add(wgpu.transfers.size_memcpy, data->size);
     _sg.wgpu.uniform.bind_offsets[ub_slot] = _sg.wgpu.uniform.offset;
     _sg.wgpu.uniform.offset = _sg_roundup_u32(_sg.wgpu.uniform.offset + (uint32_t)data->size, alignment);
     _sg.wgpu.uniform.dirty = true;
@@ -24958,6 +25027,19 @@ SOKOL_API_IMPL sg_stats sg_query_stats(void) {
     return _sg.stats;
 }
 
+SOKOL_API_IMPL void sg_add_transfer_stats(const sg_frame_stats_transfers* stats) {
+    SOKOL_ASSERT(_sg.valid && stats);
+    _sg_stats_add(external_transfers.num_write_buffer, stats->num_write_buffer);
+    _sg_stats_add(external_transfers.num_write_texture, stats->num_write_texture);
+    _sg_stats_add(external_transfers.num_copy_buffer, stats->num_copy_buffer);
+    _sg_stats_add(external_transfers.num_queue_submit, stats->num_queue_submit);
+    _sg_stats_add(external_transfers.size_write_buffer, stats->size_write_buffer);
+    _sg_stats_add(external_transfers.size_write_texture, stats->size_write_texture);
+    _sg_stats_add(external_transfers.size_write_padding, stats->size_write_padding);
+    _sg_stats_add(external_transfers.size_copy_buffer, stats->size_copy_buffer);
+    _sg_stats_add(external_transfers.size_memcpy, stats->size_memcpy);
+}
+
 SOKOL_API_IMPL sg_trace_hooks sg_install_trace_hooks(const sg_trace_hooks* trace_hooks) {
     SOKOL_ASSERT(_sg.valid);
     SOKOL_ASSERT(trace_hooks);
@@ -26727,6 +26809,26 @@ SOKOL_API_IMPL const void* sg_wgpu_queue(void) {
 SOKOL_API_IMPL const void* sg_wgpu_command_encoder(void) {
     #if defined(SOKOL_WGPU)
         return (const void*) _sg.wgpu.cmd_enc;
+    #else
+        return 0;
+    #endif
+}
+
+SOKOL_API_IMPL void sg_wgpu_arm_frame_timestamps(const void* query_set) {
+    SOKOL_ASSERT(_sg.valid);
+    #if defined(SOKOL_WGPU)
+        SOKOL_ASSERT(!_sg.wgpu.cmd_enc);
+        SOKOL_ASSERT(!query_set || wgpuDeviceHasFeature(_sg.wgpu.dev, WGPUFeatureName_TimestampQuery));
+        _sg.wgpu.timestamp_query = (WGPUQuerySet)query_set;
+        _sg.wgpu.timestamp_passes = 0;
+    #else
+        SOKOL_ASSERT(!query_set);
+    #endif
+}
+
+SOKOL_API_IMPL uint32_t sg_wgpu_frame_timestamp_passes(void) {
+    #if defined(SOKOL_WGPU)
+        return _sg.wgpu.timestamp_passes;
     #else
         return 0;
     #endif
