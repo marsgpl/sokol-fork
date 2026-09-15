@@ -2281,6 +2281,7 @@ typedef enum sg_resource_state {
     SG_RESOURCESTATE_VALID,
     SG_RESOURCESTATE_FAILED,
     SG_RESOURCESTATE_INVALID,
+    SG_RESOURCESTATE_UNSEALED, // Slopa: incremental immutable image initialization
     _SG_RESOURCESTATE_FORCE_U32 = 0x7FFFFFFF
 } sg_resource_state;
 
@@ -3330,6 +3331,8 @@ typedef struct sg_image_usage {
     // through sg_write_image_region / sg_write_image_layer, never
     // sg_update_image, so num_slots = 1
     bool gpu_write_only;
+    // Slopa: upstream initialization subset, owned 2D RGBA8 images on Metal/WebGPU only.
+    bool write_unsealed;
 } sg_image_usage;
 
 /*
@@ -3381,6 +3384,33 @@ typedef enum sg_view_type {
 typedef struct sg_image_data {
     sg_range mip_levels[SG_MAX_MIPMAPS];
 } sg_image_data;
+
+// Slopa: upstream-compatible descriptors; this backport supports one RGBA8 2D slice.
+// Default pitch is the full mip width, default extent the remainder after dst.x/y.
+typedef struct sg_image_extent {
+    int width;
+    int height;
+    int num_slices;
+} sg_image_extent;
+
+typedef struct sg_image_location {
+    sg_image image;
+    int mip_level;
+    int x, y, slice;
+} sg_image_location;
+
+typedef struct sg_write_image_source {
+    sg_range data;
+    size_t offset;
+    int bytes_per_row;
+    int bytes_per_slice;
+} sg_write_image_source;
+
+typedef struct sg_write_image_desc {
+    sg_write_image_source src;
+    sg_image_location dst;
+    sg_image_extent size;
+} sg_write_image_desc;
 
 /*
     sg_image_desc
@@ -4041,6 +4071,8 @@ typedef struct sg_trace_hooks {
     void (*destroy_view)(sg_view view, void* user_data);
     void (*update_buffer)(sg_buffer buf, const sg_range* data, void* user_data);
     void (*update_image)(sg_image img, const sg_image_data* data, void* user_data);
+    void (*write_image_unsealed)(const sg_write_image_desc* desc, void* user_data);
+    void (*seal_image)(sg_image img, void* user_data);
     void (*append_buffer)(sg_buffer buf, const sg_range* data, int result, void* user_data);
     void (*begin_pass)(const sg_pass* pass, void* user_data);
     void (*apply_viewport)(int x, int y, int width, int height, bool origin_top_left, void* user_data);
@@ -4380,6 +4412,8 @@ typedef struct sg_frame_stats {
     uint32_t num_update_buffer;
     uint32_t num_append_buffer;
     uint32_t num_update_image;
+    uint32_t num_write_image_unsealed;
+    uint32_t num_seal_image;
 
     uint32_t size_apply_uniforms;
     uint32_t size_update_buffer;
@@ -4625,6 +4659,10 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(VALIDATE_BUFFERDESC_STORAGEBUFFER_SIZE_MULTIPLE_4, "size of storage buffers must be a multiple of 4") \
     _SG_LOGITEM_XMACRO(VALIDATE_IMAGEDATA_NODATA, "sg_image_data: no data (.ptr and/or .size is zero)") \
     _SG_LOGITEM_XMACRO(VALIDATE_IMAGEDATA_DATA_SIZE, "sg_image_data: data size doesn't match expected surface size") \
+    _SG_LOGITEM_XMACRO(IMAGE_UNSEALED_DESC, "unsealed image requires owned immutable 2D RGBA8, no initial data or attachment/storage usage, Metal/WebGPU/dummy backend") \
+    _SG_LOGITEM_XMACRO(WRITE_IMAGE_UNSEALED_STATE, "sg_write_image_unsealed: image must be alive and unsealed") \
+    _SG_LOGITEM_XMACRO(WRITE_IMAGE_UNSEALED_RANGE, "sg_write_image_unsealed: invalid source pitch/span or destination mip/region") \
+    _SG_LOGITEM_XMACRO(SEAL_IMAGE_STATE, "sg_seal_image: image must be alive and unsealed") \
     _SG_LOGITEM_XMACRO(VALIDATE_IMAGEDESC_CANARY, "sg_image_desc not initialized") \
     _SG_LOGITEM_XMACRO(VALIDATE_IMAGEDESC_IMMUTABLE_DYNAMIC_STREAM, "sg_image_desc.usage: only one of .immutable, .dynamic_update, .stream_update can be true") \
     _SG_LOGITEM_XMACRO(VALIDATE_IMAGEDESC_ATTACHMENT_COLOR_DEPTH_STENCIL, "sg_image_desc.usage: only one of .color_attachment and .depth_stencil_attachment can be true") \
@@ -5197,6 +5235,12 @@ SOKOL_GFX_API_DECL void sg_destroy_pipeline(sg_pipeline pip);
 SOKOL_GFX_API_DECL void sg_destroy_view(sg_view view);
 SOKOL_GFX_API_DECL void sg_update_buffer(sg_buffer buf, const sg_range* data);
 SOKOL_GFX_API_DECL void sg_update_image(sg_image img, const sg_image_data* data);
+// Create unsealed with no data, write on the GPU owner, then seal before views.
+// The caller initializes every sampled texel. Sealed writes and unsupported
+// formats/backends are rejected; see sg_image_usage.write_unsealed.
+SOKOL_GFX_API_DECL void sg_write_image_unsealed(const sg_write_image_desc* desc);
+SOKOL_GFX_API_DECL void sg_seal_image(sg_image img);
+
 SOKOL_GFX_API_DECL int sg_append_buffer(sg_buffer buf, const sg_range* data);
 SOKOL_GFX_API_DECL bool sg_query_buffer_overflow(sg_buffer buf);
 SOKOL_GFX_API_DECL bool sg_query_buffer_will_overflow(sg_buffer buf, size_t size);
@@ -5521,6 +5565,7 @@ inline sg_shader sg_make_shader(const sg_shader_desc& desc) { return sg_make_sha
 inline sg_pipeline sg_make_pipeline(const sg_pipeline_desc& desc) { return sg_make_pipeline(&desc); }
 inline sg_view sg_make_view(const sg_view_desc& desc) { return sg_make_view(&desc); }
 inline void sg_update_image(sg_image img, const sg_image_data& data) { return sg_update_image(img, &data); }
+inline void sg_write_image_unsealed(const sg_write_image_desc& desc) { sg_write_image_unsealed(&desc); }
 
 inline void sg_begin_pass(const sg_pass& pass) { return sg_begin_pass(&pass); }
 inline void sg_apply_bindings(const sg_bindings& bindings) { return sg_apply_bindings(&bindings); }
@@ -22986,7 +23031,33 @@ _SOKOL_PRIVATE void _sg_validate_image_data(const sg_image_data* data, sg_pixel_
     #endif
 }
 
+_SOKOL_PRIVATE bool _sg_image_unsealed_desc_supported(const sg_image_desc* desc) {
+    if (!desc->usage.write_unsealed) { return true; }
+    #if defined(SOKOL_METAL) || defined(SOKOL_WGPU) || defined(SOKOL_DUMMY_BACKEND)
+        const sg_image_usage* u = &desc->usage;
+        if (!u->immutable || u->dynamic_update || u->stream_update || u->storage_image
+            || u->color_attachment || u->resolve_attachment || u->depth_stencil_attachment
+            || desc->type != SG_IMAGETYPE_2D || desc->pixel_format != SG_PIXELFORMAT_RGBA8
+            || desc->num_slices != 1 || desc->sample_count != 1
+            || desc->width <= 0 || desc->width > INT32_MAX / 4 || desc->height <= 0
+            || desc->num_mipmaps < 1 || desc->num_mipmaps > SG_MAX_MIPMAPS
+            || desc->gl_textures[0] || desc->mtl_textures[0] || desc->d3d11_texture || desc->wgpu_texture) {
+            return false;
+        }
+        for (int mip = 0; mip < SG_MAX_MIPMAPS; mip++) {
+            if (desc->data.mip_levels[mip].ptr || desc->data.mip_levels[mip].size) { return false; }
+        }
+        return true;
+    #else
+        return false;
+    #endif
+}
+
 _SOKOL_PRIVATE bool _sg_validate_image_desc(const sg_image_desc* desc) {
+    if (!_sg_image_unsealed_desc_supported(desc)) {
+        _SG_ERROR(IMAGE_UNSEALED_DESC);
+        return false;
+    }
     #if !defined(SOKOL_DEBUG)
         _SOKOL_UNUSED(desc);
         return true;
@@ -23058,7 +23129,7 @@ _SOKOL_PRIVATE bool _sg_validate_image_desc(const sg_image_desc* desc) {
             if (is_compressed) {
                 _SG_VALIDATE(usg->immutable, VALIDATE_IMAGEDESC_COMPRESSED_IMMUTABLE);
             }
-            if (!injected && usg->immutable) {
+            if (!injected && !usg->write_unsealed && usg->immutable) {
                 // image desc must have valid data
                 _sg_validate_image_data(&desc->data,
                     desc->pixel_format,
@@ -24898,10 +24969,13 @@ _SOKOL_PRIVATE void _sg_init_image(_sg_image_t* img, const sg_image_desc* desc) 
     if (_sg_validate_image_desc(desc)) {
         _sg_image_common_init(&img->cmn, desc);
         img->slot.state = _sg_create_image(img, desc);
+        if (desc->usage.write_unsealed && img->slot.state == SG_RESOURCESTATE_VALID) {
+            img->slot.state = SG_RESOURCESTATE_UNSEALED;
+        }
     } else {
         img->slot.state = SG_RESOURCESTATE_FAILED;
     }
-    SOKOL_ASSERT((img->slot.state == SG_RESOURCESTATE_VALID)||(img->slot.state == SG_RESOURCESTATE_FAILED));
+    SOKOL_ASSERT((img->slot.state == SG_RESOURCESTATE_VALID)||(img->slot.state == SG_RESOURCESTATE_FAILED) || (img->slot.state == SG_RESOURCESTATE_UNSEALED));
     _sg_resource_stats_inc(images.inited);
 }
 
@@ -24994,7 +25068,7 @@ _SOKOL_PRIVATE void _sg_uninit_buffer(_sg_buffer_t* buf) {
 }
 
 _SOKOL_PRIVATE void _sg_uninit_image(_sg_image_t* img) {
-    SOKOL_ASSERT(img && ((img->slot.state == SG_RESOURCESTATE_VALID) || (img->slot.state == SG_RESOURCESTATE_FAILED)));
+    SOKOL_ASSERT(img && ((img->slot.state == SG_RESOURCESTATE_VALID) || (img->slot.state == SG_RESOURCESTATE_FAILED) || (img->slot.state == SG_RESOURCESTATE_UNSEALED)));
     _sg_discard_image(img);
     _sg_reset_image_to_alloc_state(img);
     _sg_resource_stats_inc(images.uninited);
@@ -25165,7 +25239,7 @@ _SOKOL_PRIVATE void _sg_discard_all_resources(void) {
     }
     for (int i = 1; i < _sg.pools.image_pool.size; i++) {
         sg_resource_state state = _sg.pools.images[i].slot.state;
-        if ((state == SG_RESOURCESTATE_VALID) || (state == SG_RESOURCESTATE_FAILED)) {
+        if ((state == SG_RESOURCESTATE_VALID) || (state == SG_RESOURCESTATE_FAILED) || (state == SG_RESOURCESTATE_UNSEALED)) {
             _sg_discard_image(&_sg.pools.images[i]);
         }
     }
@@ -25495,7 +25569,7 @@ SOKOL_API_IMPL void sg_init_image(sg_image img_id, const sg_image_desc* desc) {
     if (img) {
         if (img->slot.state == SG_RESOURCESTATE_ALLOC) {
             _sg_init_image(img, &desc_def);
-            SOKOL_ASSERT((img->slot.state == SG_RESOURCESTATE_VALID) || (img->slot.state == SG_RESOURCESTATE_FAILED));
+            SOKOL_ASSERT((img->slot.state == SG_RESOURCESTATE_VALID) || (img->slot.state == SG_RESOURCESTATE_FAILED) || (img->slot.state == SG_RESOURCESTATE_UNSEALED));
         } else {
             _SG_ERROR(INIT_IMAGE_INVALID_STATE);
         }
@@ -25583,7 +25657,7 @@ SOKOL_API_IMPL void sg_uninit_image(sg_image img_id) {
     SOKOL_ASSERT(_sg.valid);
     _sg_image_t* img = _sg_lookup_image(img_id.id);
     if (img) {
-        if ((img->slot.state == SG_RESOURCESTATE_VALID) || (img->slot.state == SG_RESOURCESTATE_FAILED)) {
+        if ((img->slot.state == SG_RESOURCESTATE_VALID) || (img->slot.state == SG_RESOURCESTATE_FAILED) || (img->slot.state == SG_RESOURCESTATE_UNSEALED)) {
             _sg_uninit_image(img);
             SOKOL_ASSERT(img->slot.state == SG_RESOURCESTATE_ALLOC);
         } else if (img->slot.state != SG_RESOURCESTATE_ALLOC) {
@@ -25793,7 +25867,7 @@ SOKOL_API_IMPL sg_image sg_make_image(const sg_image_desc* desc) {
         _sg_image_t* img = _sg_image_at(img_id.id);
         SOKOL_ASSERT(img && (img->slot.state == SG_RESOURCESTATE_ALLOC));
         _sg_init_image(img, &desc_def);
-        SOKOL_ASSERT((img->slot.state == SG_RESOURCESTATE_VALID) || (img->slot.state == SG_RESOURCESTATE_FAILED));
+        SOKOL_ASSERT((img->slot.state == SG_RESOURCESTATE_VALID) || (img->slot.state == SG_RESOURCESTATE_FAILED) || (img->slot.state == SG_RESOURCESTATE_UNSEALED));
     }
     _SG_TRACE_ARGS(make_image, &desc_def, img_id);
     return img_id;
@@ -25880,7 +25954,7 @@ SOKOL_API_IMPL void sg_destroy_image(sg_image img_id) {
     _SG_TRACE_ARGS(destroy_image, img_id);
     _sg_image_t* img = _sg_lookup_image(img_id.id);
     if (img) {
-        if ((img->slot.state == SG_RESOURCESTATE_VALID) || (img->slot.state == SG_RESOURCESTATE_FAILED)) {
+        if ((img->slot.state == SG_RESOURCESTATE_VALID) || (img->slot.state == SG_RESOURCESTATE_FAILED) || (img->slot.state == SG_RESOURCESTATE_UNSEALED)) {
             _sg_uninit_image(img);
             SOKOL_ASSERT(img->slot.state == SG_RESOURCESTATE_ALLOC);
         }
@@ -26335,6 +26409,89 @@ SOKOL_API_IMPL bool sg_query_buffer_will_overflow(sg_buffer buf_id, size_t size)
         }
     }
     return result;
+}
+
+_SOKOL_PRIVATE bool _sg_image_unsealed_write_desc(const _sg_image_t* img, sg_write_image_desc* d) {
+    if (d->dst.mip_level < 0 || d->dst.mip_level >= img->cmn.num_mipmaps) { return false; }
+    const int w = _sg_miplevel_dim(img->cmn.width, d->dst.mip_level);
+    const int h = _sg_miplevel_dim(img->cmn.height, d->dst.mip_level);
+    if (d->dst.x < 0 || d->dst.x >= w || d->dst.y < 0 || d->dst.y >= h || d->dst.slice != 0) { return false; }
+    d->size.width = _sg_def(d->size.width, w - d->dst.x);
+    d->size.height = _sg_def(d->size.height, h - d->dst.y);
+    d->size.num_slices = _sg_def(d->size.num_slices, 1);
+    d->src.bytes_per_row = _sg_def(d->src.bytes_per_row, w * 4);
+    if (d->size.width <= 0 || d->size.width > w - d->dst.x
+        || d->size.height <= 0 || d->size.height > h - d->dst.y || d->size.num_slices != 1
+        || d->src.bytes_per_row < d->size.width * 4 || (d->src.bytes_per_row % 4) != 0) { return false; }
+    if (d->src.bytes_per_slice == 0) {
+        if (h > INT32_MAX / d->src.bytes_per_row) { return false; }
+        d->src.bytes_per_slice = h * d->src.bytes_per_row;
+    }
+    const uint64_t span = (uint64_t)(d->size.height - 1) * (uint64_t)d->src.bytes_per_row + (uint64_t)d->size.width * 4;
+    return d->src.data.ptr && d->src.bytes_per_slice > 0
+        && (d->src.bytes_per_slice % d->src.bytes_per_row) == 0
+        && (uint64_t)d->src.bytes_per_slice >= span
+        && d->src.offset <= d->src.data.size && span <= d->src.data.size - d->src.offset;
+}
+
+SOKOL_API_IMPL void sg_write_image_unsealed(const sg_write_image_desc* desc) {
+    SOKOL_ASSERT(_sg.valid && desc);
+    _sg_stats_inc(num_write_image_unsealed);
+    _sg_image_t* img = _sg_lookup_image(desc->dst.image.id);
+    if (!img || img->slot.state != SG_RESOURCESTATE_UNSEALED || !img->cmn.usage.write_unsealed) {
+        _SG_ERROR(WRITE_IMAGE_UNSEALED_STATE);
+        return;
+    }
+    sg_write_image_desc d = *desc;
+    if (!_sg_image_unsealed_write_desc(img, &d)) {
+        _SG_ERROR(WRITE_IMAGE_UNSEALED_RANGE);
+        return;
+    }
+    const uint8_t* ptr = (const uint8_t*)d.src.data.ptr + d.src.offset;
+    const size_t payload = (size_t)d.size.width * (size_t)d.size.height * 4;
+    #if defined(SOKOL_WGPU)
+        const size_t span = (size_t)(d.size.height - 1) * (size_t)d.src.bytes_per_row + (size_t)d.size.width * 4;
+        _SG_STRUCT(WGPUTexelCopyTextureInfo, dst);
+        dst.texture = img->wgpu.tex;
+        dst.mipLevel = (uint32_t)d.dst.mip_level;
+        dst.origin.x = (uint32_t)d.dst.x;
+        dst.origin.y = (uint32_t)d.dst.y;
+        dst.aspect = WGPUTextureAspect_All;
+        _SG_STRUCT(WGPUTexelCopyBufferLayout, layout);
+        layout.bytesPerRow = (uint32_t)d.src.bytes_per_row;
+        layout.rowsPerImage = (uint32_t)d.size.height;
+        _SG_STRUCT(WGPUExtent3D, extent);
+        extent.width = (uint32_t)d.size.width;
+        extent.height = (uint32_t)d.size.height;
+        extent.depthOrArrayLayers = 1;
+        wgpuQueueWriteTexture(_sg.wgpu.queue, &dst, ptr, span, &layout, &extent);
+        _sg_stats_inc(wgpu.transfers.num_write_texture);
+        _sg_stats_add(wgpu.transfers.size_write_texture, payload);
+        _sg_stats_add(wgpu.transfers.size_write_padding, span - payload);
+    #elif defined(SOKOL_METAL)
+        SOKOL_ASSERT(img->cmn.active_slot == 0);
+        __unsafe_unretained id<MTLTexture> texture = _sg_mtl_id(img->mtl.tex[0]);
+        [texture replaceRegion:MTLRegionMake2D((NSUInteger)d.dst.x, (NSUInteger)d.dst.y, (NSUInteger)d.size.width, (NSUInteger)d.size.height)
+            mipmapLevel:(NSUInteger)d.dst.mip_level withBytes:ptr bytesPerRow:(NSUInteger)d.src.bytes_per_row];
+        _sg_stats_inc(external_transfers.num_write_texture);
+        _sg_stats_add(external_transfers.size_write_texture, payload);
+    #else
+        _SOKOL_UNUSED(ptr);
+        _SOKOL_UNUSED(payload);
+    #endif
+    _SG_TRACE_ARGS(write_image_unsealed, desc);
+}
+
+SOKOL_API_IMPL void sg_seal_image(sg_image img_id) {
+    SOKOL_ASSERT(_sg.valid);
+    _sg_stats_inc(num_seal_image);
+    _sg_image_t* img = _sg_lookup_image(img_id.id);
+    if (!img || img->slot.state != SG_RESOURCESTATE_UNSEALED) {
+        _SG_ERROR(SEAL_IMAGE_STATE);
+        return;
+    }
+    img->slot.state = SG_RESOURCESTATE_VALID;
+    _SG_TRACE_ARGS(seal_image, img_id);
 }
 
 SOKOL_API_IMPL void sg_update_image(sg_image img_id, const sg_image_data* data) {
