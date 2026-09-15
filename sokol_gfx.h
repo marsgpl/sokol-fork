@@ -24413,10 +24413,14 @@ _SOKOL_PRIVATE bool _sg_validate_draw_ex(int base_element, int num_elements, int
         if (!_sg.use_indexed_draw) {
             _SG_VALIDATE(base_vertex == 0, VALIDATE_DRAW_EX_BASEVERTEX_VS_INDEXED);
         }
+        // Metal/WebGPU always forward base_instance, including storage-pulled singletons.
+        // GL/D3D11 select non-instanced entry points for those draws; keep their guard.
+        #if !defined(SOKOL_METAL) && !defined(SOKOL_WGPU)
         const bool use_instanced_draw = (num_instances > 1) || _sg.use_instanced_draw;
         if (!use_instanced_draw) {
             _SG_VALIDATE(base_instance == 0, VALIDATE_DRAW_EX_BASEINSTANCE_VS_INSTANCED);
         }
+        #endif
         _SG_VALIDATE(_sg.required_bindings_and_uniforms == _sg.applied_bindings_and_uniforms, VALIDATE_DRAW_REQUIRED_BINDINGS_OR_UNIFORMS_MISSING);
         return _sg_validate_end();
     #endif
