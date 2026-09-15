@@ -66,7 +66,8 @@ void wgpuQueueSubmit(WGPUQueue queue, size_t count, const WGPUCommandBuffer* buf
 }
 
 static void reset(void) {
-    static uint8_t staging[1024];
+    static uint8_t staging[4096];
+    if (_sg.wgpu.uniform.records) _sg_free(_sg.wgpu.uniform.records);
     memset(&_sg, 0, sizeof _sg);
     memset(&calls, 0, sizeof calls);
     _sg.valid = true;
@@ -179,10 +180,62 @@ static void test_external_frame_lifetime(void) {
     assert(_sg.stats.cur_frame.external_transfers.num_write_buffer == 0);
 }
 
+static void test_unique_payloads_and_capacities(void) {
+    reset();
+    _sg_shader_t shader = {0};
+    _sg_pipeline_t pipeline = {0};
+    shader.slot.id = 1;
+    pipeline.slot.id = 2;
+    pipeline.cmn.shader = _sg_shader_ref(&shader);
+    _sg.cur_pip = _sg_pipeline_ref(&pipeline);
+    uint32_t a[4] = {1,2,3,4}, b[4] = {5,6,7,8};
+    _sg_wgpu_apply_uniforms(0, &(sg_range){a, sizeof a});
+    _sg_wgpu_apply_uniforms(0, &(sg_range){a, sizeof a});
+    _sg_wgpu_apply_uniforms(0, &(sg_range){b, sizeof b});
+    // Force a hash collision: equality must still compare the actual bytes.
+    _sg.wgpu.uniform.records[2].hash = _sg.wgpu.uniform.records[0].hash;
+    _sg_wgpu_apply_uniforms(1, &(sg_range){a, sizeof a});
+    ++shader.slot.uninit_count;
+    pipeline.cmn.shader = _sg_shader_ref(&shader);
+    _sg_wgpu_apply_uniforms(0, &(sg_range){a, sizeof a});
+    _sg_wgpu_apply_uniforms(0, &(sg_range){a, sizeof a / 2});
+    ++pipeline.slot.id; // same shader/slot/data is reusable across pipelines
+    _sg.cur_pip = _sg_pipeline_ref(&pipeline);
+    _sg_wgpu_apply_uniforms(0, &(sg_range){a, sizeof a});
+    uint8_t before[7 * 256];
+    memcpy(before, _sg.wgpu.uniform.staging, sizeof before);
+    _sg_wgpu_uniform_system_on_commit();
+    assert(memcmp(before, _sg.wgpu.uniform.staging, sizeof before) == 0);
+    assert(_sg.stats.cur_frame.wgpu.uniforms.num_unique == 5);
+    assert(_sg.stats.cur_frame.wgpu.uniforms.size_unique == 72);
+    assert(_sg.stats.cur_frame.wgpu.uniforms.size_copy == 104);
+    assert(_sg.stats.cur_frame.wgpu.uniforms.size_hash == 104);
+    assert(_sg.stats.cur_frame.wgpu.uniforms.size_compare > 0);
+    assert(calls.bytes == 7 * 256 && _sg.wgpu.uniform.num_records == 0);
+    _sg.wgpu.bindgroups_pool.pool.size = 9;
+    _sg.wgpu.bindgroups_pool.pool.queue_top = 5;
+    _sg.wgpu.bindgroups_cache.num = 8;
+    sg_wgpu_memory_stats memory = sg_query_stats().wgpu_memory;
+    assert(memory.uniform_gpu_bytes == 4096 && memory.uniform_staging_bytes == 4096);
+    assert(memory.uniform_profiling_bytes == 16 * sizeof(_sg_wgpu_uniform_record_t));
+    assert(memory.bindgroups_alive == 3 && memory.bindgroups_capacity == 8);
+    assert(memory.bindgroup_cache_bytes == 8 * sizeof(_sg_wgpu_bindgroup_handle_t)
+           + 9 * (sizeof(_sg_wgpu_bindgroup_t) + sizeof(uint32_t)) + 8 * sizeof(int));
+    _sg_update_stats();
+    _sg_wgpu_apply_uniforms(0, &(sg_range){a, sizeof a});
+    _sg_wgpu_uniform_system_on_commit();
+    assert(_sg.stats.cur_frame.wgpu.uniforms.size_unique == 16); // a fresh commit
+    reset();
+    sg_disable_stats();
+    _sg_wgpu_apply_uniforms(0, &(sg_range){a, sizeof a});
+    assert(!_sg.wgpu.uniform.records && _sg.stats.cur_frame.wgpu.uniforms.size_hash == 0);
+}
+
 int main(void) {
     test_padding();
     test_uniform_and_empty_binds();
     test_real_pass_timestamps();
     test_external_frame_lifetime();
-    puts("Sokol WebGPU instrumentation: 4 tests passed");
+    test_unique_payloads_and_capacities();
+    puts("Sokol WebGPU instrumentation: 5 tests passed");
 }
