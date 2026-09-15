@@ -4282,6 +4282,10 @@ typedef struct sg_frame_stats_wgpu_uniforms {
     uint32_t num_set_bindgroup;
     uint32_t size_write_buffer;
     uint32_t size_copy; // payload copied into the uniform ring, before alignment
+    uint32_t num_unique; // exact content, per shader lifetime and uniform slot, within this commit
+    uint32_t size_unique;
+    uint32_t size_hash; // profiling bytes hashed; uploaded bytes are unchanged
+    uint64_t size_compare; // profiling memcmp range sizes, including sort comparisons
 } sg_frame_stats_wgpu_uniforms;
 
 typedef struct sg_frame_stats_wgpu_bindings {
@@ -4397,10 +4401,21 @@ typedef struct sg_frame_stats {
     sg_frame_stats_vk vk;
 } sg_frame_stats;
 
+// Known CPU/GPU capacities only; excludes opaque native objects and driver allocations.
+typedef struct sg_wgpu_memory_stats {
+    uint64_t uniform_gpu_bytes;
+    uint64_t uniform_staging_bytes;
+    uint64_t uniform_profiling_bytes;
+    uint64_t bindgroup_cache_bytes;
+    uint32_t bindgroups_alive;
+    uint32_t bindgroups_capacity;
+} sg_wgpu_memory_stats;
+
 typedef struct sg_stats {
     sg_frame_stats prev_frame;
     sg_frame_stats cur_frame;
     sg_total_stats total;
+    sg_wgpu_memory_stats wgpu_memory; // zero on other backends
 } sg_stats;
 
 /*
@@ -6977,12 +6992,24 @@ typedef struct _sg_view_s {
 } _sg_wgpu_view_t;
 typedef _sg_wgpu_view_t _sg_view_t;
 
+// Profiling references bytes already stored in the uniform ring; no second payload copy.
+typedef struct {
+    uint64_t shader;
+    uint64_t hash;
+    uint32_t slot;
+    uint32_t size;
+    uint32_t offset;
+} _sg_wgpu_uniform_record_t;
+
 // a pool of per-frame uniform buffers
 typedef struct {
     uint32_t num_bytes;
     uint32_t offset;    // current offset into buf
     uint8_t* staging;   // intermediate buffer for uniform data updates
     WGPUBuffer buf;     // the GPU-side uniform buffer
+    _sg_wgpu_uniform_record_t* records;
+    uint32_t num_records;
+    uint32_t max_records;
     bool dirty;
     uint32_t bind_offsets[SG_MAX_UNIFORMBLOCK_BINDSLOTS];   // NOTE: index is sokol-gfx ub slot index!
 } _sg_wgpu_uniform_system_t;
@@ -17424,6 +17451,12 @@ _SOKOL_PRIVATE void _sg_wgpu_uniform_system_discard(void) {
         _sg_free(_sg.wgpu.uniform.staging);
         _sg.wgpu.uniform.staging = 0;
     }
+    if (_sg.wgpu.uniform.records) {
+        _sg_free(_sg.wgpu.uniform.records);
+        _sg.wgpu.uniform.records = 0;
+    }
+    _sg.wgpu.uniform.num_records = 0;
+    _sg.wgpu.uniform.max_records = 0;
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_set_bindgroup(void) {
@@ -17470,7 +17503,59 @@ _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_apply_pipeline(void) {
     _sg.wgpu.uniform.dirty = true;
 }
 
+_SOKOL_PRIVATE uint64_t _sg_wgpu_hash(const void* key, int len, uint64_t seed);
+
+_SOKOL_PRIVATE void _sg_wgpu_uniform_stats_record(int ub_slot, uint32_t size) {
+    if (!_sg.stats_enabled) {
+        return;
+    }
+    _sg_wgpu_uniform_system_t* u = &_sg.wgpu.uniform;
+    const uint32_t alignment = _sg.wgpu.limits.minUniformBufferOffsetAlignment;
+    SOKOL_ASSERT(size > 0 && alignment > 0);
+    if (!u->records) {
+        u->max_records = (u->num_bytes - 1) / alignment + 1;
+        u->records = (_sg_wgpu_uniform_record_t*)_sg_malloc((size_t)u->max_records * sizeof(*u->records));
+        SOKOL_ASSERT(u->records);
+    }
+    SOKOL_ASSERT(u->num_records < u->max_records);
+    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+    const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+    _sg_wgpu_uniform_record_t* rec = &u->records[u->num_records++];
+    rec->shader = ((uint64_t)shd->slot.uninit_count << 32) | shd->slot.id;
+    rec->hash = _sg_wgpu_hash(u->staging + u->offset, (int)size, 0x1234567887654321);
+    rec->slot = (uint32_t)ub_slot;
+    rec->size = size;
+    rec->offset = u->offset;
+    _sg_stats_add(wgpu.uniforms.size_hash, size);
+}
+
+_SOKOL_PRIVATE int _sg_wgpu_uniform_stats_compare(const void* lhs, const void* rhs) {
+    const _sg_wgpu_uniform_record_t* a = (const _sg_wgpu_uniform_record_t*)lhs;
+    const _sg_wgpu_uniform_record_t* b = (const _sg_wgpu_uniform_record_t*)rhs;
+    if (a->shader != b->shader) { return a->shader < b->shader ? -1 : 1; }
+    if (a->slot != b->slot) { return a->slot < b->slot ? -1 : 1; }
+    if (a->size != b->size) { return a->size < b->size ? -1 : 1; }
+    if (a->hash != b->hash) { return a->hash < b->hash ? -1 : 1; }
+    _sg_stats_add(wgpu.uniforms.size_compare, a->size);
+    return memcmp(_sg.wgpu.uniform.staging + a->offset, _sg.wgpu.uniform.staging + b->offset, a->size);
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_uniform_stats_finish(void) {
+    _sg_wgpu_uniform_system_t* u = &_sg.wgpu.uniform;
+    if (_sg.stats_enabled && u->num_records > 0) {
+        qsort(u->records, u->num_records, sizeof(*u->records), _sg_wgpu_uniform_stats_compare);
+        for (uint32_t i = 0; i < u->num_records; ++i) {
+            if (i == 0 || _sg_wgpu_uniform_stats_compare(&u->records[i-1], &u->records[i]) != 0) {
+                _sg_stats_inc(wgpu.uniforms.num_unique);
+                _sg_stats_add(wgpu.uniforms.size_unique, u->records[i].size);
+            }
+        }
+    }
+    u->num_records = 0;
+}
+
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_commit(void) {
+    _sg_wgpu_uniform_stats_finish();
     wgpuQueueWriteBuffer(_sg.wgpu.queue, _sg.wgpu.uniform.buf, 0, _sg.wgpu.uniform.staging, _sg.wgpu.uniform.offset);
     _sg_stats_inc(wgpu.transfers.num_write_buffer);
     _sg_stats_add(wgpu.transfers.size_write_buffer, _sg.wgpu.uniform.offset);
@@ -18911,6 +18996,7 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_uniforms(int ub_slot, const sg_range* data) {
     SOKOL_ASSERT(data->size <= _SG_WGPU_MAX_UNIFORM_UPDATE_SIZE);
 
     memcpy(_sg.wgpu.uniform.staging + _sg.wgpu.uniform.offset, data->ptr, data->size);
+    _sg_wgpu_uniform_stats_record(ub_slot, (uint32_t)data->size);
     _sg_stats_add(wgpu.uniforms.size_copy, (uint32_t)data->size);
     _sg_stats_add(wgpu.transfers.size_write_padding, _sg_roundup_u32((uint32_t)data->size, alignment) - data->size);
     _sg_stats_add(wgpu.transfers.size_memcpy, data->size);
@@ -25024,6 +25110,18 @@ SOKOL_API_IMPL sg_stats sg_query_stats(void) {
     _sg_update_alive_free_resource_stats(&_sg.stats.total.samplers, &_sg.pools.sampler_pool);
     _sg_update_alive_free_resource_stats(&_sg.stats.total.shaders, &_sg.pools.shader_pool);
     _sg_update_alive_free_resource_stats(&_sg.stats.total.pipelines, &_sg.pools.pipeline_pool);
+    #if defined(SOKOL_WGPU)
+        const _sg_wgpu_uniform_system_t* u = &_sg.wgpu.uniform;
+        const _sg_pool_t* p = &_sg.wgpu.bindgroups_pool.pool;
+        _sg.stats.wgpu_memory.uniform_gpu_bytes = u->buf ? u->num_bytes : 0;
+        _sg.stats.wgpu_memory.uniform_staging_bytes = u->staging ? u->num_bytes : 0;
+        _sg.stats.wgpu_memory.uniform_profiling_bytes = (uint64_t)u->max_records * sizeof(*u->records);
+        _sg.stats.wgpu_memory.bindgroup_cache_bytes = (uint64_t)_sg.wgpu.bindgroups_cache.num * sizeof(_sg_wgpu_bindgroup_handle_t)
+            + (uint64_t)p->size * (sizeof(_sg_wgpu_bindgroup_t) + sizeof(uint32_t))
+            + (uint64_t)(p->size > 0 ? p->size - 1 : 0) * sizeof(int);
+        _sg.stats.wgpu_memory.bindgroups_alive = p->size > 0 ? (uint32_t)(p->size - 1 - p->queue_top) : 0;
+        _sg.stats.wgpu_memory.bindgroups_capacity = p->size > 0 ? (uint32_t)(p->size - 1) : 0;
+    #endif
     return _sg.stats;
 }
 
