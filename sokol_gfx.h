@@ -3331,7 +3331,7 @@ typedef struct sg_image_usage {
     // through sg_write_image_region / sg_write_image_layer, never
     // sg_update_image, so num_slots = 1
     bool gpu_write_only;
-    // Slopa: upstream initialization subset, owned 2D RGBA8 images on Metal/WebGPU only.
+    // Slopa: upstream initialization subset, owned 2D RGBA8, BC7, ASTC 4x4 or ETC2 RGBA8 on Metal/WebGPU.
     bool write_unsealed;
 } sg_image_usage;
 
@@ -3385,7 +3385,8 @@ typedef struct sg_image_data {
     sg_range mip_levels[SG_MAX_MIPMAPS];
 } sg_image_data;
 
-// Slopa: upstream-compatible descriptors; this backport supports one RGBA8 2D slice.
+// Slopa: upstream-compatible descriptors; this backport supports one 2D slice in the formats listed above.
+// Pitch counts bytes per block row; extent/origin use logical texels, including edge mips.
 // Default pitch is the full mip width, default extent the remainder after dst.x/y.
 typedef struct sg_image_extent {
     int width;
@@ -4659,7 +4660,7 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(VALIDATE_BUFFERDESC_STORAGEBUFFER_SIZE_MULTIPLE_4, "size of storage buffers must be a multiple of 4") \
     _SG_LOGITEM_XMACRO(VALIDATE_IMAGEDATA_NODATA, "sg_image_data: no data (.ptr and/or .size is zero)") \
     _SG_LOGITEM_XMACRO(VALIDATE_IMAGEDATA_DATA_SIZE, "sg_image_data: data size doesn't match expected surface size") \
-    _SG_LOGITEM_XMACRO(IMAGE_UNSEALED_DESC, "unsealed image requires owned immutable 2D RGBA8, no initial data or attachment/storage usage, Metal/WebGPU/dummy backend") \
+    _SG_LOGITEM_XMACRO(IMAGE_UNSEALED_DESC, "unsealed image requires owned immutable 2D RGBA8/BC7/ASTC4x4/ETC2_RGBA8, no initial data or attachment/storage usage, Metal/WebGPU/dummy backend") \
     _SG_LOGITEM_XMACRO(WRITE_IMAGE_UNSEALED_STATE, "sg_write_image_unsealed: image must be alive and unsealed") \
     _SG_LOGITEM_XMACRO(WRITE_IMAGE_UNSEALED_RANGE, "sg_write_image_unsealed: invalid source pitch/span or destination mip/region") \
     _SG_LOGITEM_XMACRO(SEAL_IMAGE_STATE, "sg_seal_image: image must be alive and unsealed") \
@@ -23035,11 +23036,15 @@ _SOKOL_PRIVATE bool _sg_image_unsealed_desc_supported(const sg_image_desc* desc)
     if (!desc->usage.write_unsealed) { return true; }
     #if defined(SOKOL_METAL) || defined(SOKOL_WGPU) || defined(SOKOL_DUMMY_BACKEND)
         const sg_image_usage* u = &desc->usage;
+        const sg_pixel_format fmt = desc->pixel_format;
+        const bool is_compressed = fmt == SG_PIXELFORMAT_BC7_RGBA || fmt == SG_PIXELFORMAT_ASTC_4x4_RGBA || fmt == SG_PIXELFORMAT_ETC2_RGBA8;
+        if (!is_compressed && fmt != SG_PIXELFORMAT_RGBA8) { return false; }
+        if (is_compressed && ((desc->width % 4) || (desc->height % 4))) { return false; }
         if (!u->immutable || u->dynamic_update || u->stream_update || u->storage_image
             || u->color_attachment || u->resolve_attachment || u->depth_stencil_attachment
-            || desc->type != SG_IMAGETYPE_2D || desc->pixel_format != SG_PIXELFORMAT_RGBA8
+            || desc->type != SG_IMAGETYPE_2D
             || desc->num_slices != 1 || desc->sample_count != 1
-            || desc->width <= 0 || desc->width > INT32_MAX / 4 || desc->height <= 0
+            || desc->width <= 0 || desc->width > INT32_MAX / 4 || desc->height <= 0 || desc->height > INT32_MAX / 4
             || desc->num_mipmaps < 1 || desc->num_mipmaps > SG_MAX_MIPMAPS
             || desc->gl_textures[0] || desc->mtl_textures[0] || desc->d3d11_texture || desc->wgpu_texture) {
             return false;
@@ -26415,19 +26420,29 @@ _SOKOL_PRIVATE bool _sg_image_unsealed_write_desc(const _sg_image_t* img, sg_wri
     if (d->dst.mip_level < 0 || d->dst.mip_level >= img->cmn.num_mipmaps) { return false; }
     const int w = _sg_miplevel_dim(img->cmn.width, d->dst.mip_level);
     const int h = _sg_miplevel_dim(img->cmn.height, d->dst.mip_level);
+    const sg_pixel_format fmt = img->cmn.pixel_format;
+    const int block = _sg_block_dim(fmt);
+    const int block_bytes = _sg_block_bytesize(fmt);
     if (d->dst.x < 0 || d->dst.x >= w || d->dst.y < 0 || d->dst.y >= h || d->dst.slice != 0) { return false; }
     d->size.width = _sg_def(d->size.width, w - d->dst.x);
     d->size.height = _sg_def(d->size.height, h - d->dst.y);
     d->size.num_slices = _sg_def(d->size.num_slices, 1);
-    d->src.bytes_per_row = _sg_def(d->src.bytes_per_row, w * 4);
     if (d->size.width <= 0 || d->size.width > w - d->dst.x
         || d->size.height <= 0 || d->size.height > h - d->dst.y || d->size.num_slices != 1
-        || d->src.bytes_per_row < d->size.width * 4 || (d->src.bytes_per_row % 4) != 0) { return false; }
+        || (d->dst.x % block) || (d->dst.y % block)
+        || ((d->size.width % block) && d->size.width != w - d->dst.x)
+        || ((d->size.height % block) && d->size.height != h - d->dst.y)
+        || (block > 1 && (d->src.offset % (size_t)block_bytes))) { return false; }
+    const int row_bytes = _sg_row_pitch(fmt, d->size.width, 1);
+    const int rows = _sg_num_rows(fmt, d->size.height);
+    d->src.bytes_per_row = _sg_def(d->src.bytes_per_row, _sg_row_pitch(fmt, w, 1));
+    if (d->src.bytes_per_row < row_bytes || (d->src.bytes_per_row % block_bytes)) { return false; }
     if (d->src.bytes_per_slice == 0) {
-        if (h > INT32_MAX / d->src.bytes_per_row) { return false; }
-        d->src.bytes_per_slice = h * d->src.bytes_per_row;
+        const int mip_rows = _sg_num_rows(fmt, h);
+        if (mip_rows > INT32_MAX / d->src.bytes_per_row) { return false; }
+        d->src.bytes_per_slice = mip_rows * d->src.bytes_per_row;
     }
-    const uint64_t span = (uint64_t)(d->size.height - 1) * (uint64_t)d->src.bytes_per_row + (uint64_t)d->size.width * 4;
+    const uint64_t span = (uint64_t)(rows - 1) * (uint64_t)d->src.bytes_per_row + (uint64_t)row_bytes;
     return d->src.data.ptr && d->src.bytes_per_slice > 0
         && (d->src.bytes_per_slice % d->src.bytes_per_row) == 0
         && (uint64_t)d->src.bytes_per_slice >= span
@@ -26448,9 +26463,12 @@ SOKOL_API_IMPL void sg_write_image_unsealed(const sg_write_image_desc* desc) {
         return;
     }
     const uint8_t* ptr = (const uint8_t*)d.src.data.ptr + d.src.offset;
-    const size_t payload = (size_t)d.size.width * (size_t)d.size.height * 4;
+    const int row_bytes = _sg_row_pitch(img->cmn.pixel_format, d.size.width, 1);
+    const int rows = _sg_num_rows(img->cmn.pixel_format, d.size.height);
+    const size_t payload = (size_t)row_bytes * (size_t)rows;
     #if defined(SOKOL_WGPU)
-        const size_t span = (size_t)(d.size.height - 1) * (size_t)d.src.bytes_per_row + (size_t)d.size.width * 4;
+        const int block = _sg_block_dim(img->cmn.pixel_format);
+        const size_t span = (size_t)(rows - 1) * (size_t)d.src.bytes_per_row + (size_t)row_bytes;
         _SG_STRUCT(WGPUTexelCopyTextureInfo, dst);
         dst.texture = img->wgpu.tex;
         dst.mipLevel = (uint32_t)d.dst.mip_level;
@@ -26459,10 +26477,11 @@ SOKOL_API_IMPL void sg_write_image_unsealed(const sg_write_image_desc* desc) {
         dst.aspect = WGPUTextureAspect_All;
         _SG_STRUCT(WGPUTexelCopyBufferLayout, layout);
         layout.bytesPerRow = (uint32_t)d.src.bytes_per_row;
-        layout.rowsPerImage = (uint32_t)d.size.height;
+        layout.rowsPerImage = (uint32_t)(d.src.bytes_per_slice / d.src.bytes_per_row);
         _SG_STRUCT(WGPUExtent3D, extent);
-        extent.width = (uint32_t)d.size.width;
-        extent.height = (uint32_t)d.size.height;
+        // WebGPU copies physical blocks; Metal replaceRegion takes the logical edge extent.
+        extent.width = (uint32_t)_sg_roundup(d.size.width, block);
+        extent.height = (uint32_t)_sg_roundup(d.size.height, block);
         extent.depthOrArrayLayers = 1;
         wgpuQueueWriteTexture(_sg.wgpu.queue, &dst, ptr, span, &layout, &extent);
         _sg_stats_inc(wgpu.transfers.num_write_texture);
