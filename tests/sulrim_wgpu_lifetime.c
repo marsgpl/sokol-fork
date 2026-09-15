@@ -6,7 +6,7 @@
 #include <setjmp.h>
 
 struct WGPUBufferImpl { int refs, destroyed; uint64_t size; uint8_t data[256]; };
-struct WGPUTextureImpl { int refs, destroyed; };
+struct WGPUTextureImpl { int refs, destroyed; unsigned width, height, mips; uint8_t data[SG_MAX_MIPMAPS][1024]; };
 struct WGPUTextureViewImpl { WGPUTexture texture; };
 struct WGPUCommandEncoderImpl {
     WGPUBuffer src, dst;
@@ -18,7 +18,7 @@ static struct {
     struct WGPUTextureImpl textures[256];
     struct WGPUTextureViewImpl views[256];
     struct WGPUCommandEncoderImpl encoders[256];
-    unsigned buffers_n, textures_n, views_n, encoders_n, submits, index_binds, group_releases;
+    unsigned buffers_n, textures_n, views_n, encoders_n, submits, index_binds, group_releases, texture_writes;
     WGPUIndexFormat index_format;
     uint32_t offsets[SG_MAX_UNIFORMBLOCK_BINDSLOTS];
     size_t offsets_n;
@@ -53,7 +53,9 @@ WGPUTexture wgpuDeviceCreateTexture(WGPUDevice device, const WGPUTextureDescript
     (void)device; (void)desc;
     if (mock.is_create_failure) return 0;
     assert(mock.textures_n < 256);
-    WGPUTexture t = &mock.textures[mock.textures_n++]; t->refs = 1; return t;
+    WGPUTexture t = &mock.textures[mock.textures_n++]; t->refs = 1;
+    t->width = desc->size.width; t->height = desc->size.height; t->mips = desc->mipLevelCount;
+    return t;
 }
 void wgpuTextureAddRef(WGPUTexture t) { assert(t->refs > 0); t->refs++; }
 void wgpuTextureRelease(WGPUTexture t) { assert(t->refs > 0); t->refs--; }
@@ -64,7 +66,18 @@ void wgpuTextureDestroy(WGPUTexture t) {
 }
 void wgpuQueueWriteTexture(WGPUQueue queue, const WGPUTexelCopyTextureInfo* dst, const void* data, size_t size,
                           const WGPUTexelCopyBufferLayout* layout, const WGPUExtent3D* extent) {
-    (void)queue; (void)data; (void)size; (void)layout; (void)extent; assert(!dst->texture->destroyed);
+    (void)queue; WGPUTexture t = dst->texture;
+    assert(!t->destroyed && dst->mipLevel < t->mips && extent->depthOrArrayLayers == 1);
+    unsigned w = (unsigned)_sg_miplevel_dim((int)t->width, (int)dst->mipLevel);
+    unsigned h = (unsigned)_sg_miplevel_dim((int)t->height, (int)dst->mipLevel);
+    assert(dst->origin.x + extent->width <= w && dst->origin.y + extent->height <= h && dst->origin.z == 0);
+    assert(w * h * 4 <= sizeof t->data[0]);
+    assert(layout->offset + (extent->height - 1) * layout->bytesPerRow + extent->width * 4 <= size);
+    for (unsigned y = 0; y < extent->height; ++y) {
+        memcpy(t->data[dst->mipLevel] + ((dst->origin.y + y) * w + dst->origin.x) * 4,
+               (const uint8_t*)data + layout->offset + y * layout->bytesPerRow, extent->width * 4);
+    }
+    mock.texture_writes++;
 }
 WGPUTextureView wgpuTextureCreateView(WGPUTexture t, const WGPUTextureViewDescriptor* desc) {
     (void)desc; assert(!t->destroyed); assert(mock.views_n < 256);
@@ -330,8 +343,77 @@ static void test_sparse_uniforms_and_index_format(void) {
     _sg.wgpu.rpass_enc = 0; _sg_wgpu_discard_shader(&shd);
     check_shutdown();
 }
+static void test_unsealed_images(void) {
+    setup(8);
+    const sg_image_desc desc = {.width = 8, .height = 4, .num_mipmaps = 4, .usage.write_unsealed = true};
+    sg_image img = sg_make_image(&desc);
+    WGPUTexture texture = (WGPUTexture)sg_wgpu_query_image_info(img).tex;
+    assert(sg_query_image_state(img) == SG_RESOURCESTATE_UNSEALED && mock.texture_writes == 0);
+    // Even with debug validation disabled, no view can expose an unsealed texture.
+    sg_view view = sg_make_view(&(sg_view_desc){.texture.image = img});
+    assert(sg_query_view_state(view) == SG_RESOURCESTATE_FAILED);
+    sg_destroy_view(view);
+    uint8_t data[256];
+    for (unsigned i = 0; i < sizeof data; ++i) data[i] = (uint8_t)i;
+    sg_write_image_unsealed(&(sg_write_image_desc){.src.data = {data, 128}, .dst.image = img});
+    assert(mock.texture_writes == 1 && memcmp(texture->data[0], data, 128) == 0);
+    sg_write_image_desc patch = {.src = {.data = {data, 64}, .offset = 4, .bytes_per_row = 16, .bytes_per_slice = 32},
+        .dst = {.image = img, .x = 2, .y = 1}, .size = {.width = 2, .height = 2}};
+    sg_write_image_unsealed(&patch);
+    assert(memcmp(texture->data[0] + 40, data + 4, 8) == 0);
+    assert(memcmp(texture->data[0] + 72, data + 20, 8) == 0);
+    assert(texture->data[0][39] == 39 && texture->data[0][48] == 48);
+    for (int mip = 1; mip < 4; ++mip) {
+        size_t bytes = (size_t)_sg_miplevel_dim(8, mip) * (size_t)_sg_miplevel_dim(4, mip) * 4;
+        sg_write_image_unsealed(&(sg_write_image_desc){.src.data = {data, bytes}, .dst = {.image = img, .mip_level = mip}});
+        assert(memcmp(texture->data[mip], data, bytes) == 0);
+    }
+    unsigned before = mock.texture_writes;
+    // Reject invalid shifts, negative regions, overflow, short rows and undersized source spans before the backend.
+    sg_write_image_desc bad[] = {patch, patch, patch, patch, patch, patch, patch};
+    bad[0].dst.mip_level = -1; bad[1].dst.mip_level = 1000;
+    bad[2].dst.x = -1; bad[3].src.offset = SIZE_MAX;
+    bad[4].src.bytes_per_row = 4; bad[5].src.data.size = 27;
+    bad[6].size.num_slices = 2;
+    for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; ++i) sg_write_image_unsealed(&bad[i]);
+    assert(mock.texture_writes == before);
+    sg_seal_image(img);
+    assert(sg_query_image_state(img) == SG_RESOURCESTATE_VALID);
+    view = sg_make_view(&(sg_view_desc){.texture.image = img});
+    assert(sg_query_view_state(view) == SG_RESOURCESTATE_VALID);
+    sg_write_image_unsealed(&patch);
+    assert(mock.texture_writes == before); // sealed writes stay rejected without validation
+    sg_destroy_view(view); sg_destroy_image(img); sg_commit();
+    sg_frame_stats stats = sg_query_stats().prev_frame;
+    assert(stats.wgpu.transfers.num_write_texture == 5);
+    assert(stats.wgpu.transfers.size_write_texture == 188 && stats.wgpu.transfers.size_write_padding == 8);
+    assert(texture->destroyed && texture->refs == 0);
+
+    // Partial and never-started images obey the existing retirement and slot-generation contract.
+    img = sg_make_image(&desc); texture = (WGPUTexture)sg_wgpu_query_image_info(img).tex;
+    begin(); sg_destroy_image(img);
+    assert(!texture->destroyed);
+    sg_image replacement = sg_make_image(&desc);
+    patch.dst.image = img; sg_write_image_unsealed(&patch); sg_seal_image(img);
+    assert(mock.texture_writes == before && sg_query_image_state(replacement) == SG_RESOURCESTATE_UNSEALED);
+    sg_commit(); assert(texture->destroyed);
+    sg_uninit_image(replacement);
+    assert(sg_query_image_state(replacement) == SG_RESOURCESTATE_ALLOC);
+    sg_init_image(replacement, &desc);
+    assert(sg_query_image_state(replacement) == SG_RESOURCESTATE_UNSEALED);
+    // Unsupported compressed images cannot enter the partial-write path, even with validation disabled.
+    sg_image_desc compressed = desc; compressed.pixel_format = SG_PIXELFORMAT_BC7_RGBA;
+    img = sg_make_image(&compressed); assert(sg_query_image_state(img) == SG_RESOURCESTATE_FAILED); sg_destroy_image(img);
+    compressed = desc; compressed.usage.dynamic_update = true;
+    img = sg_make_image(&compressed); assert(sg_query_image_state(img) == SG_RESOURCESTATE_FAILED); sg_destroy_image(img);
+    compressed = desc; compressed.data.mip_levels[0] = (sg_range){data, 128};
+    img = sg_make_image(&compressed); assert(sg_query_image_state(img) == SG_RESOURCESTATE_FAILED); sg_destroy_image(img);
+    check_shutdown(); // leaves one unsealed image alive for shutdown to collect
+}
+
 int main(void) {
     test_copy_and_reuse(); test_borrowed_failed_and_readback(); test_capacity_budget_and_shutdown();
     test_full_queue(); test_views_and_images(); test_sparse_uniforms_and_index_format();
-    puts("Sokol WebGPU P1: 6 lifetime/correctness tests passed");
+    test_unsealed_images();
+    puts("Sokol WebGPU P1/P2: 7 lifetime, correctness and unsealed-image tests passed");
 }
