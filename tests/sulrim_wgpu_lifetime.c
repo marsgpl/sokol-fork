@@ -6,7 +6,7 @@
 #include <setjmp.h>
 
 struct WGPUBufferImpl { int refs, destroyed; uint64_t size; uint8_t data[256]; };
-struct WGPUTextureImpl { int refs, destroyed; unsigned width, height, mips; uint8_t data[SG_MAX_MIPMAPS][1024]; };
+struct WGPUTextureImpl { int refs, destroyed; unsigned width, height, mips, block, block_bytes; uint8_t data[SG_MAX_MIPMAPS][1024]; };
 struct WGPUTextureViewImpl { WGPUTexture texture; };
 struct WGPUCommandEncoderImpl {
     WGPUBuffer src, dst;
@@ -55,6 +55,8 @@ WGPUTexture wgpuDeviceCreateTexture(WGPUDevice device, const WGPUTextureDescript
     assert(mock.textures_n < 256);
     WGPUTexture t = &mock.textures[mock.textures_n++]; t->refs = 1;
     t->width = desc->size.width; t->height = desc->size.height; t->mips = desc->mipLevelCount;
+    bool is_compressed = desc->format == WGPUTextureFormat_BC7RGBAUnorm || desc->format == WGPUTextureFormat_ASTC4x4Unorm || desc->format == WGPUTextureFormat_ETC2RGBA8Unorm;
+    t->block = is_compressed ? 4 : 1; t->block_bytes = is_compressed ? 16 : 4;
     return t;
 }
 void wgpuTextureAddRef(WGPUTexture t) { assert(t->refs > 0); t->refs++; }
@@ -70,12 +72,18 @@ void wgpuQueueWriteTexture(WGPUQueue queue, const WGPUTexelCopyTextureInfo* dst,
     assert(!t->destroyed && dst->mipLevel < t->mips && extent->depthOrArrayLayers == 1);
     unsigned w = (unsigned)_sg_miplevel_dim((int)t->width, (int)dst->mipLevel);
     unsigned h = (unsigned)_sg_miplevel_dim((int)t->height, (int)dst->mipLevel);
-    assert(dst->origin.x + extent->width <= w && dst->origin.y + extent->height <= h && dst->origin.z == 0);
-    assert(w * h * 4 <= sizeof t->data[0]);
-    assert(layout->offset + (extent->height - 1) * layout->bytesPerRow + extent->width * 4 <= size);
-    for (unsigned y = 0; y < extent->height; ++y) {
-        memcpy(t->data[dst->mipLevel] + ((dst->origin.y + y) * w + dst->origin.x) * 4,
-               (const uint8_t*)data + layout->offset + y * layout->bytesPerRow, extent->width * 4);
+    w = (w + t->block - 1) / t->block; h = (h + t->block - 1) / t->block;
+    assert(!(extent->width % t->block) && !(extent->height % t->block));
+    assert(!(dst->origin.x % t->block) && !(dst->origin.y % t->block));
+    unsigned x = dst->origin.x / t->block, y0 = dst->origin.y / t->block;
+    unsigned rows = extent->height / t->block, row_bytes = extent->width / t->block * t->block_bytes;
+    assert(x + extent->width / t->block <= w && y0 + rows <= h && dst->origin.z == 0);
+    assert(w * h * t->block_bytes <= sizeof t->data[0]);
+    assert(layout->rowsPerImage >= rows && !(layout->bytesPerRow % t->block_bytes));
+    assert(layout->offset + (rows - 1) * layout->bytesPerRow + row_bytes <= size);
+    for (unsigned y = 0; y < rows; ++y) {
+        memcpy(t->data[dst->mipLevel] + ((y0 + y) * w + x) * t->block_bytes,
+               (const uint8_t*)data + layout->offset + y * layout->bytesPerRow, row_bytes);
     }
     mock.texture_writes++;
 }
@@ -401,8 +409,8 @@ static void test_unsealed_images(void) {
     assert(sg_query_image_state(replacement) == SG_RESOURCESTATE_ALLOC);
     sg_init_image(replacement, &desc);
     assert(sg_query_image_state(replacement) == SG_RESOURCESTATE_UNSEALED);
-    // Unsupported compressed images cannot enter the partial-write path, even with validation disabled.
-    sg_image_desc compressed = desc; compressed.pixel_format = SG_PIXELFORMAT_BC7_RGBA;
+    // Unsupported formats cannot enter the partial-write path, even with validation disabled.
+    sg_image_desc compressed = desc; compressed.pixel_format = SG_PIXELFORMAT_BC1_RGBA;
     img = sg_make_image(&compressed); assert(sg_query_image_state(img) == SG_RESOURCESTATE_FAILED); sg_destroy_image(img);
     compressed = desc; compressed.usage.dynamic_update = true;
     img = sg_make_image(&compressed); assert(sg_query_image_state(img) == SG_RESOURCESTATE_FAILED); sg_destroy_image(img);
@@ -411,9 +419,62 @@ static void test_unsealed_images(void) {
     check_shutdown(); // leaves one unsealed image alive for shutdown to collect
 }
 
+static void test_unsealed_compressed_images(void) {
+    const sg_pixel_format formats[] = {SG_PIXELFORMAT_BC7_RGBA, SG_PIXELFORMAT_ASTC_4x4_RGBA, SG_PIXELFORMAT_ETC2_RGBA8};
+    for (unsigned f = 0; f < 3; ++f) {
+        setup(8);
+        sg_image_desc desc = {.width = 12, .height = 20, .num_mipmaps = 5, .pixel_format = formats[f], .usage.write_unsealed = true};
+        sg_image img = sg_make_image(&desc);
+        assert(sg_query_image_state(img) == SG_RESOURCESTATE_UNSEALED);
+        WGPUTexture texture = (WGPUTexture)sg_wgpu_query_image_info(img).tex;
+        uint8_t data[512];
+        for (unsigned i = 0; i < sizeof data; ++i) data[i] = (uint8_t)(i * 17 + i / 7);
+        uint64_t payload = 0;
+        for (int mip = 0; mip < 5; ++mip) {
+            int w = _sg_miplevel_dim(12, mip), h = _sg_miplevel_dim(20, mip);
+            size_t bytes = (size_t)((w + 3) / 4) * ((h + 3) / 4) * 16;
+            sg_write_image_unsealed(&(sg_write_image_desc){.src.data = {data, bytes}, .dst = {.image = img, .mip_level = mip}});
+            assert(memcmp(texture->data[mip], data, bytes) == 0);
+            payload += bytes;
+        }
+        // Padded two-block-row subrect, then an odd edge subrect at the 6x10 mip.
+        sg_write_image_desc patch = {.src = {.data = {data, 96}, .offset = 16, .bytes_per_row = 48, .bytes_per_slice = 96},
+            .dst = {.image = img, .x = 4, .y = 4}, .size = {.width = 8, .height = 8}};
+        sg_write_image_unsealed(&patch);
+        assert(memcmp(texture->data[0] + 64, data + 16, 32) == 0);
+        assert(memcmp(texture->data[0] + 112, data + 64, 32) == 0);
+        sg_write_image_desc edge = {.src.data = {data, 16}, .src.bytes_per_row = 16,
+            .dst = {.image = img, .mip_level = 1, .x = 4, .y = 8}};
+        sg_write_image_unsealed(&edge);
+        assert(memcmp(texture->data[1] + 80, data, 16) == 0);
+        unsigned before = mock.texture_writes;
+        sg_write_image_desc bad[] = {patch, patch, patch, patch, patch, patch, patch, patch, patch, patch, patch};
+        bad[0].dst.x = 2; bad[1].dst.y = 1; bad[2].size.width = 6; bad[3].size.height = 5;
+        bad[4].src.bytes_per_row = 33; bad[5].src.bytes_per_row = 16; bad[6].src.offset = 1;
+        bad[7].src.data.size = 95; bad[8].src.bytes_per_slice = 48;
+        bad[9].dst.mip_level = INT32_MAX; bad[10].size.height = INT32_MAX;
+        for (unsigned i = 0; i < sizeof bad / sizeof bad[0]; ++i) sg_write_image_unsealed(&bad[i]);
+        assert(mock.texture_writes == before);
+        sg_seal_image(img); sg_write_image_unsealed(&patch);
+        assert(sg_query_image_state(img) == SG_RESOURCESTATE_VALID && mock.texture_writes == before);
+        sg_destroy_image(img); sg_commit();
+        sg_frame_stats stats = sg_query_stats().prev_frame;
+        assert(stats.wgpu.transfers.num_write_texture == 7);
+        assert(stats.wgpu.transfers.size_write_texture == payload + 80 && stats.wgpu.transfers.size_write_padding == 16);
+        assert(texture->destroyed && !texture->refs);
+        desc.width = 11;
+        img = sg_make_image(&desc); assert(sg_query_image_state(img) == SG_RESOURCESTATE_FAILED); sg_destroy_image(img);
+        desc.width = 12;
+        img = sg_make_image(&desc); // compressed partial cancellation and stale handle
+        patch.dst.image = img; sg_write_image_unsealed(&patch);
+        sg_destroy_image(img); sg_write_image_unsealed(&patch);
+        check_shutdown();
+    }
+}
+
 int main(void) {
     test_copy_and_reuse(); test_borrowed_failed_and_readback(); test_capacity_budget_and_shutdown();
     test_full_queue(); test_views_and_images(); test_sparse_uniforms_and_index_format();
-    test_unsealed_images();
-    puts("Sokol WebGPU P1/P2: 7 lifetime, correctness and unsealed-image tests passed");
+    test_unsealed_images(); test_unsealed_compressed_images();
+    puts("Sokol WebGPU P1/P2: 8 lifetime, correctness and unsealed-image tests passed");
 }
