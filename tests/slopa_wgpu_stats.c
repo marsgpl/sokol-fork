@@ -1,4 +1,5 @@
 // Native-call mocks exercise accounting and timestamp placement, not GPU correctness.
+#define SOKOL_VALIDATE_NON_FATAL
 #define SOKOL_IMPL
 #define SOKOL_WGPU
 #include "sokol_gfx.h"
@@ -6,6 +7,8 @@
 
 static struct {
     uint32_t writes, binds, renders, computes, submits;
+    uint32_t draws, indexed_draws, elements, instances, first, instance_base;
+    int32_t vertex_base;
     uint64_t bytes;
     uint32_t pipelines, blends, stencils;
     WGPUColor blend_color;
@@ -13,6 +16,17 @@ static struct {
     WGPUPassTimestampWrites timestamps[8];
     uint32_t timestamp_count;
 } calls;
+
+void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder pass, uint32_t elements, uint32_t instances, uint32_t first, uint32_t base) {
+    (void)pass;
+    calls.draws++; calls.elements = elements; calls.instances = instances;
+    calls.first = first; calls.instance_base = base;
+}
+void wgpuRenderPassEncoderDrawIndexed(WGPURenderPassEncoder pass, uint32_t elements, uint32_t instances, uint32_t first, int32_t vertex_base, uint32_t base) {
+    (void)pass;
+    calls.indexed_draws++; calls.elements = elements; calls.instances = instances;
+    calls.first = first; calls.vertex_base = vertex_base; calls.instance_base = base;
+}
 
 WGPUBool wgpuDeviceHasFeature(WGPUDevice device, WGPUFeatureName feature) {
     (void)device;
@@ -334,12 +348,54 @@ static void test_render_state_cache(void) {
     _sg_wgpu_end_pass(&attachments);
 }
 
+static void test_direct_instance_offsets(void) {
+    reset();
+    _sg.cur_pass.in_pass = _sg.cur_pass.valid = true;
+    _sg.next_draw_valid = true;
+    _sg.features.draw_base_instance = _sg.features.draw_base_vertex = true;
+    _sg.wgpu.rpass_enc = (WGPURenderPassEncoder)1;
+    assert(!_sg.use_instanced_draw); // No per-instance vertex attributes.
+    for (int indexed = 0; indexed < 2; ++indexed) {
+        _sg.use_indexed_draw = indexed != 0;
+        for (int count = 1; count <= 4; count += 3) {
+            for (int base = 0; base <= 7; base += 7) {
+                sg_draw_ex(3, 6, count, indexed ? -2 : 0, base);
+                assert(calls.elements == 6 && calls.instances == (uint32_t)count);
+                assert(calls.first == 3 && calls.instance_base == (uint32_t)base);
+                if (indexed) assert(calls.vertex_base == -2);
+            }
+        }
+    }
+    assert(calls.draws == 4 && calls.indexed_draws == 4);
+    assert(_sg.stats.cur_frame.num_draw_ex == 8 && _sg.stats.cur_frame.num_draw == 0);
+    sg_draw(0, 3, 1);
+    assert(calls.instance_base == 0 && calls.indexed_draws == 5);
+    assert(_sg.stats.cur_frame.num_draw == 1);
+    assert(!_sg_validate_draw_ex(0, 3, 1, 0, -1));
+    _sg.features.draw_base_instance = false;
+    assert(!_sg_validate_draw_ex(0, 3, 1, 0, 7));
+    _sg.features.draw_base_instance = true;
+    _sg.use_indexed_draw = false;
+    assert(!_sg_validate_draw_ex(0, 3, 1, 1, 7));
+    _sg.required_bindings_and_uniforms = 1;
+    assert(!_sg_validate_draw_ex(0, 3, 1, 0, 7));
+    _sg.applied_bindings_and_uniforms = 1;
+    assert(_sg_validate_draw_ex(0, 3, 1, 0, 7));
+    _sg.cur_pass.is_compute = true;
+    assert(!_sg_validate_draw_ex(0, 3, 1, 0, 7));
+    _sg.cur_pass.is_compute = false;
+    sg_disable_stats();
+    sg_draw_ex(0, 3, 1, 0, 7);
+    assert(calls.draws == 5 && _sg.stats.cur_frame.num_draw_ex == 8);
+}
+
 int main(void) {
+    test_direct_instance_offsets();
     test_render_state_cache();
     test_padding();
     test_uniform_and_empty_binds();
     test_real_pass_timestamps();
     test_external_frame_lifetime();
     test_unique_payloads_and_capacities();
-    puts("Sokol WebGPU instrumentation: 6 tests passed");
+    puts("Sokol WebGPU instrumentation: 7 tests passed");
 }
