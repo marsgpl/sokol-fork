@@ -3314,10 +3314,16 @@ typedef struct sg_buffer_desc {
         the image content is updated infrequently by the CPU via sg_update_image()
     .stream_update (default: false)
         the image content is updated each frame by the CPU via sg_update_image()
+    .pass_local_depth (default: false, Slopa extension)
+        owned immutable 2D SG_PIXELFORMAT_DEPTH, one mip/slice/sample, no data.
+        Only depth-attachment views are allowed, with CLEAR/DONTCARE load and
+        DONTCARE store. No sampling, copies or readback, including native interop.
+        Metal uses memoryless storage on Apple GPUs, private storage otherwise.
+        WebGPU uses RenderAttachment only. Supported on Metal/WebGPU/dummy.
 
     Note that creating a texture view from the image to be used for
     texture-sampling in vertex-, fragment- or compute-shaders
-    is always implicitly allowed.
+    is implicitly allowed unless pass_local_depth is set.
 */
 typedef struct sg_image_usage {
     bool storage_image;
@@ -3333,6 +3339,7 @@ typedef struct sg_image_usage {
     bool gpu_write_only;
     // Slopa: upstream initialization subset, owned 2D RGBA8, BC7, ASTC 4x4 or ETC2 RGBA8 on Metal/WebGPU.
     bool write_unsealed;
+    bool pass_local_depth;
 } sg_image_usage;
 
 /*
@@ -4666,6 +4673,9 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(VALIDATE_IMAGEDATA_NODATA, "sg_image_data: no data (.ptr and/or .size is zero)") \
     _SG_LOGITEM_XMACRO(VALIDATE_IMAGEDATA_DATA_SIZE, "sg_image_data: data size doesn't match expected surface size") \
     _SG_LOGITEM_XMACRO(IMAGE_UNSEALED_DESC, "unsealed image requires owned immutable 2D RGBA8/BC7/ASTC4x4/ETC2_RGBA8, no initial data or attachment/storage usage, Metal/WebGPU/dummy backend") \
+    _SG_LOGITEM_XMACRO(IMAGE_PASS_LOCAL_DEPTH_DESC, "pass-local depth requires owned immutable 2D DEPTH, one mip/slice/sample, no data or other usage, Metal/WebGPU/dummy backend") \
+    _SG_LOGITEM_XMACRO(IMAGE_PASS_LOCAL_DEPTH_VIEW, "pass-local depth only allows depth attachment views") \
+    _SG_LOGITEM_XMACRO(IMAGE_PASS_LOCAL_DEPTH_ACTION, "pass-local depth requires CLEAR/DONTCARE load and DONTCARE store") \
     _SG_LOGITEM_XMACRO(WRITE_IMAGE_UNSEALED_STATE, "sg_write_image_unsealed: image must be alive and unsealed") \
     _SG_LOGITEM_XMACRO(WRITE_IMAGE_UNSEALED_RANGE, "sg_write_image_unsealed: invalid source pitch/span or destination mip/region") \
     _SG_LOGITEM_XMACRO(SEAL_IMAGE_STATE, "sg_seal_image: image must be alive and unsealed") \
@@ -15694,7 +15704,7 @@ _SOKOL_PRIVATE bool _sg_mtl_init_texdesc(MTLTextureDescriptor* mtl_desc, _sg_ima
 
     const sg_image_usage* usg = &img->cmn.usage;
     const bool any_attachment = usg->color_attachment || usg->resolve_attachment || usg->depth_stencil_attachment;
-    MTLTextureUsage mtl_tex_usage = MTLTextureUsageShaderRead;
+    MTLTextureUsage mtl_tex_usage = usg->pass_local_depth ? MTLTextureUsageUnknown : MTLTextureUsageShaderRead;
     if (any_attachment) {
         mtl_tex_usage |= MTLTextureUsageRenderTarget;
     }
@@ -15704,7 +15714,9 @@ _SOKOL_PRIVATE bool _sg_mtl_init_texdesc(MTLTextureDescriptor* mtl_desc, _sg_ima
     mtl_desc.usage = mtl_tex_usage;
 
     MTLResourceOptions mtl_res_options = 0;
-    if (any_attachment || img->cmn.usage.storage_image) {
+    if (usg->pass_local_depth && [_sg.mtl.device supportsFamily:MTLGPUFamilyApple1]) {
+        mtl_res_options |= MTLResourceStorageModeMemoryless;
+    } else if (any_attachment || img->cmn.usage.storage_image) {
         mtl_res_options |= MTLResourceStorageModePrivate;
     } else {
         mtl_res_options |= _sg_mtl_resource_options_storage_mode_managed_or_shared();
@@ -18476,7 +18488,7 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_image(_sg_image_t* img, const s
     } else {
         _SG_STRUCT(WGPUTextureDescriptor, wgpu_tex_desc);
         wgpu_tex_desc.label = _sg_wgpu_stringview(desc->label);
-        wgpu_tex_desc.usage = WGPUTextureUsage_TextureBinding|WGPUTextureUsage_CopyDst;
+        wgpu_tex_desc.usage = desc->usage.pass_local_depth ? WGPUTextureUsage_None : WGPUTextureUsage_TextureBinding|WGPUTextureUsage_CopyDst;
         if (desc->usage.color_attachment || desc->usage.resolve_attachment || desc->usage.depth_stencil_attachment) {
             wgpu_tex_desc.usage |= WGPUTextureUsage_RenderAttachment;
         }
@@ -23109,7 +23121,32 @@ _SOKOL_PRIVATE bool _sg_image_unsealed_desc_supported(const sg_image_desc* desc)
     #endif
 }
 
+_SOKOL_PRIVATE bool _sg_image_pass_local_depth_desc_supported(const sg_image_desc* desc) {
+    if (!desc->usage.pass_local_depth) { return true; }
+    #if defined(SOKOL_METAL) || defined(SOKOL_WGPU) || defined(SOKOL_DUMMY_BACKEND)
+        const sg_image_usage* u = &desc->usage;
+        if (!u->immutable || !u->depth_stencil_attachment || u->color_attachment || u->resolve_attachment
+            || u->storage_image || u->dynamic_update || u->stream_update || u->gpu_write_only || u->write_unsealed
+            || desc->type != SG_IMAGETYPE_2D || desc->pixel_format != SG_PIXELFORMAT_DEPTH
+            || desc->num_mipmaps != 1 || desc->num_slices != 1 || desc->sample_count != 1
+            || desc->width <= 0 || desc->height <= 0
+            || desc->gl_textures[0] || desc->mtl_textures[0] || desc->d3d11_texture || desc->wgpu_texture) {
+            return false;
+        }
+        for (int mip = 0; mip < SG_MAX_MIPMAPS; mip++) {
+            if (desc->data.mip_levels[mip].ptr || desc->data.mip_levels[mip].size) { return false; }
+        }
+        return true;
+    #else
+        return false;
+    #endif
+}
+
 _SOKOL_PRIVATE bool _sg_validate_image_desc(const sg_image_desc* desc) {
+    if (!_sg_image_pass_local_depth_desc_supported(desc)) {
+        _SG_ERROR(IMAGE_PASS_LOCAL_DEPTH_DESC);
+        return false;
+    }
     if (!_sg_image_unsealed_desc_supported(desc)) {
         _SG_ERROR(IMAGE_UNSEALED_DESC);
         return false;
@@ -23659,6 +23696,17 @@ _SOKOL_PRIVATE bool _sg_validate_pipeline_desc(const sg_pipeline_desc* desc) {
 }
 
 _SOKOL_PRIVATE bool _sg_validate_view_desc(const sg_view_desc* desc) {
+    const sg_image non_depth_images[] = {
+        desc->texture.image, desc->storage_image.image,
+        desc->color_attachment.image, desc->resolve_attachment.image,
+    };
+    for (size_t i = 0; i < sizeof(non_depth_images) / sizeof(non_depth_images[0]); i++) {
+        const _sg_image_t* img = _sg_lookup_image(non_depth_images[i].id);
+        if (img && img->cmn.usage.pass_local_depth) {
+            _SG_ERROR(IMAGE_PASS_LOCAL_DEPTH_VIEW);
+            return false;
+        }
+    }
     #if !defined(SOKOL_DEBUG)
         _SOKOL_UNUSED(desc);
         return true;
@@ -23809,6 +23857,15 @@ _SOKOL_PRIVATE bool _sg_validate_view_desc(const sg_view_desc* desc) {
 }
 
 _SOKOL_PRIVATE bool _sg_validate_begin_pass(const sg_pass* pass) {
+    const _sg_view_t* depth_view = _sg_lookup_view(pass->attachments.depth_stencil.id);
+    const _sg_image_t* depth_img = depth_view ? _sg_image_ref_ptr_or_null(&depth_view->cmn.img.ref) : 0;
+    if (depth_img && depth_img->cmn.usage.pass_local_depth) {
+        if ((pass->action.depth.load_action != SG_LOADACTION_CLEAR && pass->action.depth.load_action != SG_LOADACTION_DONTCARE)
+            || pass->action.depth.store_action != SG_STOREACTION_DONTCARE) {
+            _SG_ERROR(IMAGE_PASS_LOCAL_DEPTH_ACTION);
+            return false;
+        }
+    }
     #if !defined(SOKOL_DEBUG)
         _SOKOL_UNUSED(pass);
         return true;

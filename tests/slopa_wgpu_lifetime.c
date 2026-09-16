@@ -4,9 +4,10 @@
 #include "sokol_gfx.h"
 #include <stdio.h>
 #include <setjmp.h>
+#include "slopa_pass_local_depth.h"
 
 struct WGPUBufferImpl { int refs, destroyed; uint64_t size; uint8_t data[256]; };
-struct WGPUTextureImpl { int refs, destroyed; unsigned width, height, mips, block, block_bytes; uint8_t data[SG_MAX_MIPMAPS][1024]; };
+struct WGPUTextureImpl { int refs, destroyed; unsigned width, height, mips, block, block_bytes; WGPUTextureUsage usage; uint8_t data[SG_MAX_MIPMAPS][1024]; };
 struct WGPUTextureViewImpl { WGPUTexture texture; };
 struct WGPUCommandEncoderImpl {
     WGPUBuffer src, dst;
@@ -59,6 +60,7 @@ WGPUTexture wgpuDeviceCreateTexture(WGPUDevice device, const WGPUTextureDescript
     assert(mock.textures_n < 256);
     WGPUTexture t = &mock.textures[mock.textures_n++]; t->refs = 1;
     t->width = desc->size.width; t->height = desc->size.height; t->mips = desc->mipLevelCount;
+    t->usage = desc->usage;
     bool is_compressed = desc->format == WGPUTextureFormat_BC7RGBAUnorm || desc->format == WGPUTextureFormat_ASTC4x4Unorm || desc->format == WGPUTextureFormat_ETC2RGBA8Unorm;
     t->block = is_compressed ? 4 : 1; t->block_bytes = is_compressed ? 16 : 4;
     return t;
@@ -729,11 +731,27 @@ static void test_unsealed_compressed_images(void) {
     }
 }
 
+static void test_pass_local_depth(void) {
+    setup(8);
+    check_pass_local_depth_contract();
+    assert(mock.textures_n == 1 && mock.texture_writes == 0);
+    assert(mock.textures[0].usage == WGPUTextureUsage_RenderAttachment);
+    sg_image image = sg_make_image(&(sg_image_desc){.width = 16, .height = 4,
+        .pixel_format = SG_PIXELFORMAT_DEPTH, .usage.depth_stencil_attachment = true});
+    assert(sg_query_image_state(image) == SG_RESOURCESTATE_VALID);
+    WGPUTexture texture = (WGPUTexture)sg_wgpu_query_image_info(image).tex;
+    assert(texture->usage == (WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst));
+    sg_view sampled = sg_make_view(&(sg_view_desc){.texture.image = image});
+    assert(sg_query_view_state(sampled) == SG_RESOURCESTATE_VALID);
+    check_shutdown();
+}
+
 int main(void) {
+    test_pass_local_depth();
     test_uniform_minimum_sizes();
     test_binding_invalidation(); test_shader_binding_reuse(false); test_shader_binding_reuse(true);
     test_copy_and_reuse(); test_borrowed_failed_and_readback(); test_capacity_budget_and_shutdown();
     test_full_queue(); test_views_and_images(); test_sparse_uniforms_and_index_format();
     test_unsealed_images(); test_unsealed_compressed_images();
-    puts("Sokol WebGPU P1/P2/P3: lifetime, typed binding invalidation, shader reuse and unsealed-image tests passed");
+    puts("Sokol WebGPU P1/P2/P3/P4: lifetime, binding reuse, unsealed images and pass-local depth passed");
 }

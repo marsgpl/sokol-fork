@@ -1,0 +1,68 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Sokol pass-local depth contract</title>
+<pre id="result">Running...</pre>
+<script>
+// Browser counterpart to the Metal depth-clear/occlusion fixture; no Sokol/Wasm linkage.
+window.slopaPassLocalDepth = (async () => {
+    const check = (value, message) => { if (!value) throw Error(message); };
+    const adapter = await navigator.gpu.requestAdapter();
+    check(adapter, 'WebGPU adapter required');
+    const device = await adapter.requestDevice();
+    const errors = [];
+    device.addEventListener('uncapturederror', e => errors.push(e.error.message));
+    device.pushErrorScope('validation');
+    const module = device.createShaderModule({code: `
+        struct V { @builtin(position) p: vec4f, @location(0) color: vec4f }
+        @vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+            let v = i % 3; let far = i >= 3; var o: V;
+            o.p = vec4f(select(-1.0, 3.0, v == 1), select(-1.0, 3.0, v == 2), select(0.25, 0.75, far), 1);
+            o.color = select(vec4f(1, 0, 0, 1), vec4f(0, 1, 0, 1), far); return o;
+        }
+        @fragment fn fs(v: V) -> @location(0) vec4f { return v.color; }
+    `});
+    const pipeline = await device.createRenderPipelineAsync({layout: 'auto',
+        vertex: {module, entryPoint: 'vs'}, fragment: {module, entryPoint: 'fs', targets: [{format: 'rgba8unorm'}]},
+        depthStencil: {format: 'depth32float', depthCompare: 'less', depthWriteEnabled: true}});
+    let checkedPixels = 0;
+    for (const [width, height] of [[16, 4], [32, 8], [2048, 1024], [1024, 512]]) {
+        for (const isLocal of [false, true]) {
+            const depth = device.createTexture({size: [width, height], format: 'depth32float',
+                usage: GPUTextureUsage.RENDER_ATTACHMENT | (isLocal ? 0 : GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST)});
+            const color = device.createTexture({size: [width, height], format: 'rgba8unorm',
+                usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC});
+            const pitch = Math.ceil(width * 4 / 256) * 256;
+            const readback = device.createBuffer({size: pitch * height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+            for (let frame = 0; frame < 4; frame++) {
+                const encoder = device.createCommandEncoder();
+                for (let slice = 0; slice < 4; slice++) {
+                    const pass = encoder.beginRenderPass({
+                        colorAttachments: [{view: color.createView(), loadOp: slice ? 'load' : 'clear', storeOp: 'store'}],
+                        depthStencilAttachment: {view: depth.createView(), depthLoadOp: 'clear', depthStoreOp: 'discard', depthClearValue: 1},
+                    });
+                    pass.setPipeline(pipeline); pass.setViewport(slice * width / 4, 0, width / 4, height, 0, 1);
+                    if (!(slice & 1)) pass.draw(3, 1, 0);
+                    pass.draw(3, 1, 3); pass.end();
+                }
+                encoder.copyTextureToBuffer({texture: color}, {buffer: readback, bytesPerRow: pitch}, [width, height]);
+                device.queue.submit([encoder.finish()]);
+                await readback.mapAsync(GPUMapMode.READ);
+                const pixels = new Uint8Array(readback.getMappedRange());
+                for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+                    const p = y * pitch + x * 4, green = Math.floor(x / (width / 4)) & 1;
+                    check(pixels[p] === (green ? 0 : 255) && pixels[p + 1] === (green ? 255 : 0)
+                        && pixels[p + 2] === 0 && pixels[p + 3] === 255, `pixel ${width}/${height}/${isLocal}/${frame}/${x}/${y}`);
+                    checkedPixels++;
+                }
+                readback.unmap();
+            }
+            readback.destroy(); color.destroy(); depth.destroy();
+        }
+    }
+    const validation = await device.popErrorScope();
+    check(!validation && !errors.length, validation?.message || errors.join('\n'));
+    device.destroy();
+    return {checkedPixels, result: 'exact expected pixels, clear/reuse, occlusion and resize'};
+})();
+window.slopaPassLocalDepth.then(r => result.textContent = JSON.stringify(r)).catch(e => result.textContent = String(e));
+</script>
