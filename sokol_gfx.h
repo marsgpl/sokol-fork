@@ -7111,7 +7111,7 @@ typedef enum {
     _SG_WGPU_BINDGROUPSCACHEITEMTYPE_NONE     = 0,
     _SG_WGPU_BINDGROUPSCACHEITEMTYPE_VIEW     = 1,
     _SG_WGPU_BINDGROUPSCACHEITEMTYPE_SAMPLER  = 2,
-    _SG_WGPU_BINDGROUPSCACHEITEMTYPE_PIPELINE = 3,
+    _SG_WGPU_BINDGROUPSCACHEITEMTYPE_SHADER   = 3,
 } _sg_wgpu_bindgroups_cache_item_type_t;
 
 #define _SG_WGPU_BINDGROUPSCACHEKEY_NUM_ITEMS (1 + _SG_WGPU_MAX_VIEW_SMP_BINDGROUP_ENTRIES)
@@ -17800,8 +17800,8 @@ _SOKOL_PRIVATE uint64_t _sg_wgpu_bindgroups_cache_item(_sg_wgpu_bindgroups_cache
     return (bb << 56) | (t << 54) | (ccccc << 32) | iiiiiiii;
 }
 
-_SOKOL_PRIVATE uint64_t _sg_wgpu_bindgroups_cache_pip_item(const _sg_slot_t* slot) {
-    return _sg_wgpu_bindgroups_cache_item(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_PIPELINE, 0xFF, slot->id, slot->uninit_count);
+_SOKOL_PRIVATE uint64_t _sg_wgpu_bindgroups_cache_shader_item(const _sg_slot_t* slot) {
+    return _sg_wgpu_bindgroups_cache_item(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_SHADER, 0xFF, slot->id, slot->uninit_count);
 }
 
 _SOKOL_PRIVATE uint64_t _sg_wgpu_bindgroups_cache_view_item(uint8_t wgpu_binding, const _sg_slot_t* slot) {
@@ -17818,7 +17818,8 @@ _SOKOL_PRIVATE void _sg_wgpu_init_bindgroups_cache_key(_sg_wgpu_bindgroups_cache
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&bnd->pip->cmn.shader);
 
     _sg_clear(key->items, sizeof(key->items));
-    key->items[0] = _sg_wgpu_bindgroups_cache_pip_item(&bnd->pip->slot);
+    // Raster variants use the same shader-owned layout and complete resource tuple.
+    key->items[0] = _sg_wgpu_bindgroups_cache_shader_item(&shd->slot);
     for (size_t i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
         if (shd->cmn.views[i].stage == SG_SHADERSTAGE_NONE) {
             continue;
@@ -17995,8 +17996,9 @@ _SOKOL_PRIVATE uint32_t _sg_wgpu_bindgroups_cache_get(uint64_t hash) {
 // called from wgpu resource destroy functions to also invalidate any
 // bindgroups cache slot and bindgroup referencing that resource
 _SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_invalidate(_sg_wgpu_bindgroups_cache_item_type_t type, const _sg_slot_t* slot) {
-    const uint64_t key_mask = _sg_wgpu_bindgroups_cache_item(type, 0xFF, 0xFFFFFFFF, 0xFFFFFFFF);
-    const uint64_t key_item = _sg_wgpu_bindgroups_cache_item(type, 0, slot->id, slot->uninit_count) & key_mask;
+    // Ignore the binding number, but compare both type bits and the complete resource lifetime.
+    const uint64_t key_mask = (UINT64_C(1) << 56) - 1;
+    const uint64_t key_item = _sg_wgpu_bindgroups_cache_item(type, 0, slot->id, slot->uninit_count);
     SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.items);
     for (uint32_t cache_item_idx = 0; cache_item_idx < _sg.wgpu.bindgroups_cache.num; cache_item_idx++) {
         const uint32_t bg_id = _sg.wgpu.bindgroups_cache.items[cache_item_idx].id;
@@ -18802,6 +18804,7 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_shader(_sg_shader_t* shd, const
 
 _SOKOL_PRIVATE void _sg_wgpu_discard_shader(_sg_shader_t* shd) {
     SOKOL_ASSERT(shd);
+    _sg_wgpu_bindgroups_cache_invalidate(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_SHADER, &shd->slot);
     _sg_wgpu_discard_shader_func(&shd->wgpu.vertex_func);
     _sg_wgpu_discard_shader_func(&shd->wgpu.fragment_func);
     _sg_wgpu_discard_shader_func(&shd->wgpu.compute_func);
@@ -18971,7 +18974,6 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_pipeline(_sg_pipeline_t* pip, c
 
 _SOKOL_PRIVATE void _sg_wgpu_discard_pipeline(_sg_pipeline_t* pip) {
     SOKOL_ASSERT(pip);
-    _sg_wgpu_bindgroups_cache_invalidate(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_PIPELINE, &pip->slot);
     if (pip->wgpu.rpip) {
         wgpuRenderPipelineRelease(pip->wgpu.rpip);
         pip->wgpu.rpip = 0;
