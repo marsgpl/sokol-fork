@@ -18704,6 +18704,8 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_shader(_sg_shader_t* shd, const
         bgl_entry->visibility = _sg_wgpu_shader_stage(shd->cmn.uniform_blocks[i].stage);
         bgl_entry->buffer.type = WGPUBufferBindingType_Uniform;
         bgl_entry->buffer.hasDynamicOffset = true;
+        // Validate the declared block size at pipeline creation instead of each draw/dispatch.
+        bgl_entry->buffer.minBindingSize = shd->cmn.uniform_blocks[i].size;
         bg_entry->binding = bgl_entry->binding;
         bg_entry->buffer = _sg.wgpu.uniform.buf;
         bg_entry->size = _SG_WGPU_MAX_UNIFORM_UPDATE_SIZE;
