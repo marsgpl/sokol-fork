@@ -26418,11 +26418,11 @@ SOKOL_API_IMPL void sg_commit(void) {
     SOKOL_ASSERT(!_sg.cur_pass.valid);
     SOKOL_ASSERT(!_sg.cur_pass.in_pass);
     _sg_commit();
+    _sg.uniform_cache_frame++;
     _sg_update_stats();
     _sg_notify_commit_listeners();
     _SG_TRACE_NOARGS(commit);
     _sg.frame_index++;
-    _sg.uniform_cache_frame++;
 }
 
 SOKOL_API_IMPL void sg_reset_state_cache(void) {
