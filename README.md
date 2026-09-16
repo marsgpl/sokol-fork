@@ -1,3 +1,18 @@
+# ⚠️ This is a Slopa-specific fork of Sokol
+
+> [!WARNING]
+> **This repository is a modified fork, not the official Sokol repository.**
+> It contains custom APIs and backend changes for [Slopa](https://slopa.io).
+>
+> **Original project and upstream source: [floooh/sokol](https://github.com/floooh/sokol).**
+>
+> The documentation below is inherited from upstream and may not describe this
+> fork's changes or compatibility differences.
+
+<!-- 2026-09-16: Added the prominent fork disclaimer and original repository link. -->
+
+---
+
 <p align="center">
     <img src="assets/logo_full_large.png" style="width: 60%" /><br/><br/>Simple
     <a href="https://github.com/nothings/stb/blob/master/docs/stb_howto.txt">STB-style</a>
