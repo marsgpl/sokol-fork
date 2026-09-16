@@ -1,0 +1,124 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Sokol uniform layout contract</title>
+<pre id="result">Running WebGPU uniform layout checks...</pre>
+<script>
+// Mirrors the native descriptor regression; exercises browser validation and GPU readback.
+window.slopaUniformLayouts = (async () => {
+    const check = (value, message) => { if (!value) throw new Error(message); };
+    const adapter = await navigator.gpu.requestAdapter();
+    check(adapter, 'WebGPU adapter required');
+    const device = await adapter.requestDevice({requiredLimits: {maxUniformBufferBindingSize: 65536}});
+    const uncaptured = [];
+    device.addEventListener('uncapturederror', event => uncaptured.push(event.error.message));
+    async function validation(label, isExpected, run) {
+        device.pushErrorScope('validation');
+        run();
+        const error = await device.popErrorScope();
+        check(!!error === isExpected, `${label}: ${error?.message || 'expected validation error'}`);
+    }
+    const uniform = (binding, size, visibility = GPUShaderStage.COMPUTE) => ({
+        binding, visibility, buffer: {type: 'uniform', hasDynamicOffset: true, minBindingSize: size},
+    });
+    const empty = device.createBindGroupLayout({entries: []});
+    let sizesChecked = 0;
+    for (const size of [4, 12, 16, 64, 2400, 65536]) {
+        const type = size === 4 ? 'u32' : size === 12 ? 'vec3u' : `array<vec4u, ${size / 16}>`;
+        const module = device.createShaderModule({code: `
+            @group(0) @binding(7) var<uniform> u: ${type};
+            @compute @workgroup_size(1) fn main() { _ = u; }
+        `});
+        for (const minimum of [size, Math.max(1, size - 4), 0]) {
+            await validation(`pipeline ${size}/${minimum}`, minimum > 0 && minimum < size, () => {
+                const group = device.createBindGroupLayout({entries: [uniform(7, minimum)]});
+                device.createComputePipeline({layout: device.createPipelineLayout({bindGroupLayouts: [group, empty]}),
+                    compute: {module, entryPoint: 'main'}});
+            });
+        }
+        sizesChecked++;
+    }
+    const alignment = device.limits.minUniformBufferOffsetAlignment;
+    const ringEnd = alignment * 4;
+    const ring = device.createBuffer({size: ringEnd + 65536, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
+    device.queue.writeBuffer(ring, alignment, new Uint32Array([17]));
+    device.queue.writeBuffer(ring, ringEnd, new Uint32Array([33]));
+    const groupEntries = [
+        {binding: 7, resource: {buffer: ring, size: 65536}},
+        {binding: 1, resource: {buffer: ring, size: 65536}},
+    ];
+    const output = device.createBuffer({size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC});
+    const storage = device.createBindGroupLayout({entries: [{binding: 3, visibility: GPUShaderStage.COMPUTE,
+        buffer: {type: 'storage'}}]});
+    const storageGroup = device.createBindGroup({layout: storage, entries: [{binding: 3, resource: {buffer: output}}]});
+    const computeGroupLayout = device.createBindGroupLayout({entries: [uniform(7, 2400), uniform(1, 4)]});
+    const computeGroup = device.createBindGroup({layout: computeGroupLayout, entries: groupEntries});
+    const computeModule = device.createShaderModule({code: `
+        @group(0) @binding(7) var<uniform> a: array<vec4u, 150>;
+        @group(0) @binding(1) var<uniform> b: u32;
+        @group(1) @binding(3) var<storage, read_write> result: array<u32>;
+        @compute @workgroup_size(1) fn main() { result[0] = a[0].x; result[1] = b; }
+    `});
+    const compute = device.createComputePipeline({layout: device.createPipelineLayout({bindGroupLayouts: [computeGroupLayout, storage]}),
+        compute: {module: computeModule, entryPoint: 'main'}});
+    const color = device.createTexture({size: [1, 1], format: 'rgba8unorm', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC});
+    const renderGroupLayout = device.createBindGroupLayout({entries: [uniform(7, 4, GPUShaderStage.VERTEX), uniform(1, 2400, GPUShaderStage.FRAGMENT)]});
+    const renderGroup = device.createBindGroup({layout: renderGroupLayout, entries: groupEntries});
+    const renderModule = device.createShaderModule({code: `
+        @group(0) @binding(7) var<uniform> a: u32;
+        @group(0) @binding(1) var<uniform> b: array<vec4u, 150>;
+        struct V { @builtin(position) p: vec4f, @location(0) value: f32 }
+        @vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+            var v: V;
+            v.p = vec4f(select(-1.0, 3.0, i == 1), select(-1.0, 3.0, i == 2), 0, 1);
+            v.value = f32(a) / 255.0;
+            return v;
+        }
+        @fragment fn fs(v: V) -> @location(0) vec4f { return vec4f(v.value, f32(b[0].x) / 255.0, 0, 1); }
+    `});
+    const renderLayout = device.createPipelineLayout({bindGroupLayouts: [renderGroupLayout, empty]});
+    const renderDesc = {layout: renderLayout, vertex: {module: renderModule, entryPoint: 'vs'},
+        fragment: {module: renderModule, entryPoint: 'fs', targets: [{format: 'rgba8unorm'}]}};
+    const render = device.createRenderPipeline(renderDesc);
+    const sibling = device.createRenderPipeline({...renderDesc, primitive: {cullMode: 'back'}});
+    const emptyGroup = device.createBindGroup({layout: empty, entries: []});
+    const readback = device.createBuffer({size: 512, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+    await validation('render, compute, sparse offsets and final ring range', false, () => {
+        const encoder = device.createCommandEncoder();
+        const cp = encoder.beginComputePass();
+        cp.setPipeline(compute);
+        // Offsets are in binding order: binding 1, then binding 7.
+        cp.setBindGroup(0, computeGroup, [ringEnd, alignment]);
+        cp.setBindGroup(1, storageGroup); cp.dispatchWorkgroups(1); cp.end();
+        const rp = encoder.beginRenderPass({colorAttachments: [{view: color.createView(), loadOp: 'clear', storeOp: 'store'}]});
+        for (const pipeline of [render, sibling, render]) {
+            rp.setPipeline(pipeline); rp.setBindGroup(0, renderGroup, [ringEnd, alignment]);
+            rp.setBindGroup(1, emptyGroup); rp.draw(3);
+        }
+        rp.end();
+        encoder.copyBufferToBuffer(output, 0, readback, 0, 8);
+        encoder.copyTextureToBuffer({texture: color}, {buffer: readback, offset: 256, bytesPerRow: 256}, [1, 1]);
+        device.queue.submit([encoder.finish()]);
+    });
+    await readback.mapAsync(GPUMapMode.READ);
+    const bytes = readback.getMappedRange();
+    check(new Uint32Array(bytes, 0, 2).join() === '17,33', 'compute uniform values');
+    check(new Uint8Array(bytes, 256, 4).join() === '17,33,0,255', 'render uniform values');
+    readback.unmap();
+    await validation('short bind range', true, () => {
+        device.createBindGroup({layout: computeGroupLayout, entries: [groupEntries[1], {binding: 7, resource: {buffer: ring, size: 16}}]});
+    });
+    for (const offset of [1, ringEnd + 65536]) {
+        await validation(`invalid dynamic offset ${offset}`, true, () => {
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass(); pass.setPipeline(compute);
+            pass.setBindGroup(0, computeGroup, [offset, alignment]); pass.setBindGroup(1, storageGroup);
+            pass.dispatchWorkgroups(1); pass.end(); encoder.finish();
+        });
+    }
+    check(uncaptured.length === 0, uncaptured.join('\n'));
+    device.destroy();
+    return `PASS: ${sizesChecked} uniform sizes, early size rejection, sparse render/compute readback, sibling pipelines, empty group and dynamic bounds`;
+})();
+window.slopaUniformLayouts.then(text => document.querySelector('#result').textContent = text,
+    error => document.querySelector('#result').textContent = 'FAIL: ' + error.stack);
+</script>

@@ -24,6 +24,8 @@ static struct {
     WGPUIndexFormat index_format;
     uint32_t offsets[SG_MAX_UNIFORMBLOCK_BINDSLOTS];
     size_t offsets_n;
+    WGPUBindGroupLayoutEntry uniform_layout[SG_MAX_UNIFORMBLOCK_BINDSLOTS];
+    size_t uniform_layout_n;
     bool is_create_failure;
 } mock;
 
@@ -129,9 +131,29 @@ void wgpuRenderPassEncoderSetIndexBuffer(WGPURenderPassEncoder pass, WGPUBuffer 
 }
 WGPUShaderModule wgpuDeviceCreateShaderModule(WGPUDevice device, const WGPUShaderModuleDescriptor* desc) { (void)device; (void)desc; return (WGPUShaderModule)1; }
 void wgpuShaderModuleRelease(WGPUShaderModule module) { (void)module; }
-WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice device, const WGPUBindGroupLayoutDescriptor* desc) { (void)device; (void)desc; return (WGPUBindGroupLayout)1; }
+WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice device, const WGPUBindGroupLayoutDescriptor* desc) {
+    (void)device;
+    for (size_t i = 0; i < desc->entryCount; ++i) {
+        const WGPUBindGroupLayoutEntry* entry = &desc->entries[i];
+        if (entry->buffer.type == WGPUBufferBindingType_Uniform) {
+            assert(mock.uniform_layout_n < SG_MAX_UNIFORMBLOCK_BINDSLOTS);
+            mock.uniform_layout[mock.uniform_layout_n++] = *entry;
+        } else {
+            assert(entry->buffer.minBindingSize == 0);
+        }
+    }
+    return (WGPUBindGroupLayout)1;
+}
 void wgpuBindGroupLayoutRelease(WGPUBindGroupLayout layout) { (void)layout; }
-WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice device, const WGPUBindGroupDescriptor* desc) { (void)device; (void)desc; return (WGPUBindGroup)(uintptr_t)++mock.group_creates; }
+WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice device, const WGPUBindGroupDescriptor* desc) {
+    (void)device;
+    for (size_t i = 0; i < desc->entryCount; ++i) {
+        if (desc->entries[i].buffer == _sg.wgpu.uniform.buf) {
+            assert(desc->entries[i].offset == 0 && desc->entries[i].size == _SG_WGPU_MAX_UNIFORM_UPDATE_SIZE);
+        }
+    }
+    return (WGPUBindGroup)(uintptr_t)++mock.group_creates;
+}
 void wgpuBindGroupRelease(WGPUBindGroup bg) { (void)bg; mock.group_releases++; }
 void wgpuRenderPipelineRelease(WGPURenderPipeline pip) { (void)pip; }
 void wgpuComputePipelineRelease(WGPUComputePipeline pip) { (void)pip; }
@@ -342,7 +364,9 @@ static void test_sparse_uniforms_and_index_format(void) {
     setup(8);
     _sg_shader_t shd = {0}; shd.slot.id = 1;
     shd.cmn.uniform_blocks[2].stage = SG_SHADERSTAGE_VERTEX;
+    shd.cmn.uniform_blocks[2].size = 64;
     shd.cmn.uniform_blocks[5].stage = SG_SHADERSTAGE_FRAGMENT;
+    shd.cmn.uniform_blocks[5].size = 2400;
     sg_shader_desc desc = {0}; desc.uniform_blocks[2].wgsl_group0_binding_n = 7; desc.uniform_blocks[5].wgsl_group0_binding_n = 1;
     assert(_sg_wgpu_create_shader(&shd, &desc) == SG_RESOURCESTATE_VALID);
     assert(shd.wgpu.ub_num_dynoffsets == 2 && shd.wgpu.ub_dynoffsets[2] == 1 && shd.wgpu.ub_dynoffsets[5] == 0);
@@ -359,6 +383,51 @@ static void test_sparse_uniforms_and_index_format(void) {
     assert(mock.index_binds == 2 && mock.index_format == WGPUIndexFormat_Uint32);
     _sg.wgpu.rpass_enc = 0; _sg_wgpu_discard_shader(&shd);
     check_shutdown();
+}
+
+static void test_uniform_minimum_sizes(void) {
+    const uint32_t sizes[] = {4, 12, 16, 64, 2400, 65536};
+    for (int is_compute = 0; is_compute < 2; ++is_compute) {
+        setup(8);
+        _sg.limits.max_storage_buffer_bindings_per_stage = 1;
+        for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; ++i) {
+            mock.uniform_layout_n = 0;
+            sg_shader_desc desc = {
+                .uniform_blocks[2] = {.stage = is_compute ? SG_SHADERSTAGE_COMPUTE : SG_SHADERSTAGE_VERTEX,
+                    .size = sizes[i], .wgsl_group0_binding_n = 7},
+                .uniform_blocks[5] = {.stage = is_compute ? SG_SHADERSTAGE_COMPUTE : SG_SHADERSTAGE_FRAGMENT,
+                    .size = 16, .wgsl_group0_binding_n = 1},
+                .views[3].storage_buffer = {.stage = is_compute ? SG_SHADERSTAGE_COMPUTE : SG_SHADERSTAGE_FRAGMENT,
+                    .wgsl_group1_binding_n = 3, .readonly = !is_compute},
+            };
+            if (is_compute) {
+                desc.compute_func.source = "mock";
+            } else {
+                desc.vertex_func.source = desc.fragment_func.source = "mock";
+            }
+            // An inactive slot's size must not create a binding or affect either active slot.
+            desc.uniform_blocks[0].size = 65536;
+            sg_shader shader = sg_make_shader(&desc);
+            assert(sg_query_shader_state(shader) == SG_RESOURCESTATE_VALID);
+            const _sg_shader_t* shd = _sg_lookup_shader(shader.id);
+            assert(mock.uniform_layout_n == 2);
+            assert(mock.uniform_layout[0].binding == 7 && mock.uniform_layout[1].binding == 1);
+            assert(mock.uniform_layout[0].buffer.minBindingSize == sizes[i]);
+            assert(mock.uniform_layout[1].buffer.minBindingSize == 16);
+            assert(mock.uniform_layout[0].buffer.hasDynamicOffset && mock.uniform_layout[1].buffer.hasDynamicOffset);
+            assert(mock.uniform_layout[0].visibility == (is_compute ? WGPUShaderStage_Compute : WGPUShaderStage_Vertex));
+            assert(mock.uniform_layout[1].visibility == (is_compute ? WGPUShaderStage_Compute : WGPUShaderStage_Fragment));
+            assert(shd->wgpu.ub_num_dynoffsets == 2 && shd->wgpu.ub_dynoffsets[2] == 1 && shd->wgpu.ub_dynoffsets[5] == 0);
+            sg_destroy_shader(shader);
+        }
+        mock.uniform_layout_n = 0;
+        sg_shader empty = sg_make_shader(&(sg_shader_desc){0});
+        const _sg_shader_t* shd = _sg_lookup_shader(empty.id);
+        assert(mock.uniform_layout_n == 0 && shd->wgpu.ub_num_dynoffsets == 0);
+        assert(shd->wgpu.bg_ub && shd->wgpu.bg_view_smp_empty);
+        sg_destroy_shader(empty);
+        check_shutdown();
+    }
 }
 
 static void test_binding_invalidation(void) {
@@ -661,6 +730,7 @@ static void test_unsealed_compressed_images(void) {
 }
 
 int main(void) {
+    test_uniform_minimum_sizes();
     test_binding_invalidation(); test_shader_binding_reuse(false); test_shader_binding_reuse(true);
     test_copy_and_reuse(); test_borrowed_failed_and_readback(); test_capacity_budget_and_shutdown();
     test_full_queue(); test_views_and_images(); test_sparse_uniforms_and_index_format();
