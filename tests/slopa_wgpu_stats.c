@@ -399,12 +399,18 @@ static void test_direct_instance_offsets(void) {
     assert(calls.draws == 5 && _sg.stats.cur_frame.num_draw_ex == 8);
 }
 
+static void check_committed_uniform_epoch(void* user) {
+    assert(_sg.uniform_cache_frame == *(uint64_t*)user);
+}
+
 static void test_uniform_reuse(void) {
     for (int profiling = 0; profiling < 2; ++profiling) {
         reset();
         _sg.stats_enabled = profiling != 0;
-        sg_commit_listener listeners[1] = {0};
+        uint64_t expected_epoch = 2;
+        sg_commit_listener listeners[1] = {{check_committed_uniform_epoch, &expected_epoch}};
         _sg.commit_listeners.items = listeners;
+        _sg.commit_listeners.upper = 1;
         _sg_shader_t shaders[2] = {0};
         _sg_pipeline_t pipelines[4] = {0};
         for (int i = 0; i < 2; ++i) {
