@@ -19,6 +19,8 @@ static struct {
     struct WGPUTextureViewImpl views[256];
     struct WGPUCommandEncoderImpl encoders[256];
     unsigned buffers_n, textures_n, views_n, encoders_n, submits, index_binds, group_releases, texture_writes;
+    unsigned group_creates, group_binds, sampler_creates;
+    WGPUBindGroup bound_group;
     WGPUIndexFormat index_format;
     uint32_t offsets[SG_MAX_UNIFORMBLOCK_BINDSLOTS];
     size_t offsets_n;
@@ -129,13 +131,20 @@ WGPUShaderModule wgpuDeviceCreateShaderModule(WGPUDevice device, const WGPUShade
 void wgpuShaderModuleRelease(WGPUShaderModule module) { (void)module; }
 WGPUBindGroupLayout wgpuDeviceCreateBindGroupLayout(WGPUDevice device, const WGPUBindGroupLayoutDescriptor* desc) { (void)device; (void)desc; return (WGPUBindGroupLayout)1; }
 void wgpuBindGroupLayoutRelease(WGPUBindGroupLayout layout) { (void)layout; }
-WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice device, const WGPUBindGroupDescriptor* desc) { (void)device; (void)desc; return (WGPUBindGroup)1; }
+WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice device, const WGPUBindGroupDescriptor* desc) { (void)device; (void)desc; return (WGPUBindGroup)(uintptr_t)++mock.group_creates; }
 void wgpuBindGroupRelease(WGPUBindGroup bg) { (void)bg; mock.group_releases++; }
 void wgpuRenderPipelineRelease(WGPURenderPipeline pip) { (void)pip; }
 void wgpuComputePipelineRelease(WGPUComputePipeline pip) { (void)pip; }
 void wgpuSamplerRelease(WGPUSampler sampler) { (void)sampler; }
+void wgpuSamplerAddRef(WGPUSampler sampler) { (void)sampler; }
+WGPUSampler wgpuDeviceCreateSampler(WGPUDevice device, const WGPUSamplerDescriptor* desc) { (void)device; (void)desc; return (WGPUSampler)(uintptr_t)++mock.sampler_creates; }
+void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder pass, WGPURenderPipeline pip) { (void)pass; (void)pip; }
+void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder pass, WGPUComputePipeline pip) { (void)pass; (void)pip; }
+void wgpuRenderPassEncoderSetBlendConstant(WGPURenderPassEncoder pass, const WGPUColor* color) { (void)pass; (void)color; }
+void wgpuRenderPassEncoderSetStencilReference(WGPURenderPassEncoder pass, uint32_t ref) { (void)pass; (void)ref; }
 void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder pass, uint32_t index, WGPUBindGroup group, size_t count, const uint32_t* offsets) {
-    (void)pass; (void)index; (void)group; mock.offsets_n = count;
+    (void)pass; (void)index; mock.offsets_n = count;
+    mock.group_binds++; mock.bound_group = group;
     if (count) memcpy(mock.offsets, offsets, count * sizeof(*offsets));
 }
 void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder pass, uint32_t index, WGPUBindGroup group, size_t count, const uint32_t* offsets) {
@@ -290,7 +299,7 @@ static void test_views_and_images(void) {
     _sg_wgpu_bindgroup_handle_t id = _sg_wgpu_alloc_bindgroup();
     _sg_wgpu_bindgroup_t* bg = _sg_wgpu_lookup_bindgroup(id.id);
     bg->slot.state = SG_RESOURCESTATE_VALID; bg->bindgroup = (WGPUBindGroup)1;
-    bg->key.items[1] = _sg_wgpu_bindgroups_cache_view_item(0, &view->slot);
+    bg->key.items[1] = _sg_wgpu_bindgroups_cache_view_item(7, &view->slot);
     _sg_wgpu_bindgroups_cache_set(1, id.id); _sg.wgpu.bindings_cache.bg = id;
     begin(); _sg.wgpu.cmd_enc->texture = old;
     sg_uninit_image(img);
@@ -320,7 +329,7 @@ static void test_views_and_images(void) {
     _sg_view_t* storage_view = _sg_lookup_view(sv.id);
     id = _sg_wgpu_alloc_bindgroup(); bg = _sg_wgpu_lookup_bindgroup(id.id);
     bg->slot.state = SG_RESOURCESTATE_VALID; bg->bindgroup = (WGPUBindGroup)1;
-    bg->key.items[1] = _sg_wgpu_bindgroups_cache_view_item(0, &storage_view->slot);
+    bg->key.items[1] = _sg_wgpu_bindgroups_cache_view_item(3, &storage_view->slot);
     _sg_wgpu_bindgroups_cache_set(1, id.id);
     sg_destroy_buffer(storage);
     assert(_sg_wgpu_bindgroups_cache_get(1) == SG_INVALID_ID);
@@ -350,6 +359,185 @@ static void test_sparse_uniforms_and_index_format(void) {
     assert(mock.index_binds == 2 && mock.index_format == WGPUIndexFormat_Uint32);
     _sg.wgpu.rpass_enc = 0; _sg_wgpu_discard_shader(&shd);
     check_shutdown();
+}
+
+static void test_binding_invalidation(void) {
+    setup(8);
+    const uint8_t bindings[] = {0, 3, 127, 255};
+    for (int type = 1; type <= 3; ++type) {
+        for (size_t i = 0; i < sizeof bindings; ++i) {
+            _sg_slot_t slot = {.id = 0x10001, .uninit_count = 7};
+            _sg_wgpu_bindgroup_handle_t id = _sg_wgpu_alloc_bindgroup();
+            _sg_wgpu_bindgroup_t* bg = _sg_wgpu_lookup_bindgroup(id.id);
+            bg->slot.state = SG_RESOURCESTATE_VALID; bg->bindgroup = (WGPUBindGroup)1;
+            bg->key.items[0] = _sg_wgpu_bindgroups_cache_item((_sg_wgpu_bindgroups_cache_item_type_t)type, bindings[i], slot.id, slot.uninit_count);
+            _sg_wgpu_bindgroups_cache_set(1, id.id); _sg.wgpu.bindings_cache.bg = id;
+            for (int other = 1; other <= 3; ++other) {
+                if (other == type) continue;
+                _sg_wgpu_bindgroups_cache_invalidate((_sg_wgpu_bindgroups_cache_item_type_t)other, &slot);
+                assert(_sg_wgpu_bindgroups_cache_get(1) == id.id);
+            }
+            slot.uninit_count++;
+            _sg_wgpu_bindgroups_cache_invalidate((_sg_wgpu_bindgroups_cache_item_type_t)type, &slot);
+            assert(_sg_wgpu_bindgroups_cache_get(1) == id.id);
+            slot.uninit_count--;
+            slot.id += 0x10000;
+            _sg_wgpu_bindgroups_cache_invalidate((_sg_wgpu_bindgroups_cache_item_type_t)type, &slot);
+            assert(_sg_wgpu_bindgroups_cache_get(1) == id.id);
+            slot.id -= 0x10000;
+            _sg_wgpu_bindgroups_cache_invalidate((_sg_wgpu_bindgroups_cache_item_type_t)type, &slot);
+            assert(_sg_wgpu_bindgroups_cache_get(1) == SG_INVALID_ID);
+            assert(_sg.wgpu.bindings_cache.bg.id == SG_INVALID_ID);
+        }
+    }
+    check_shutdown();
+}
+
+static void test_shader_binding_reuse(bool is_compute) {
+    for (int profile = 0; profile < 2; ++profile) {
+        setup(8);
+        _sg.stats_enabled = profile != 0;
+        _sg.limits.max_storage_buffer_bindings_per_stage = 8;
+        _sg.limits.max_texture_bindings_per_stage = 16;
+        sg_shader_desc desc = {
+            .vertex_func.source = "mock vertex shader",
+            .fragment_func.source = "mock fragment shader",
+            .views[0].storage_buffer = {.stage = SG_SHADERSTAGE_VERTEX, .readonly = true, .wgsl_group1_binding_n = 3},
+            .views[4].texture = {.stage = SG_SHADERSTAGE_FRAGMENT, .wgsl_group1_binding_n = 7},
+            .samplers[2] = {.stage = SG_SHADERSTAGE_FRAGMENT, .wgsl_group1_binding_n = 11},
+        };
+        sg_shader_desc empty_desc = {.vertex_func.source = "mock empty shader"};
+        if (is_compute) {
+            desc.vertex_func.source = desc.fragment_func.source = empty_desc.vertex_func.source = 0;
+            desc.compute_func.source = empty_desc.compute_func.source = "mock compute shader";
+            desc.views[0].storage_buffer.stage = desc.views[4].texture.stage = desc.samplers[2].stage = SG_SHADERSTAGE_COMPUTE;
+        }
+        sg_shader shader = sg_make_shader(&desc), other = sg_make_shader(&desc);
+        assert(sg_query_shader_state(shader) == SG_RESOURCESTATE_VALID);
+        assert(sg_query_shader_state(other) == SG_RESOURCESTATE_VALID);
+        sg_shader empty = sg_make_shader(&empty_desc);
+        sg_buffer storage = sg_make_buffer(&(sg_buffer_desc){.size = 512, .usage = {.dynamic_update = true, .storage_buffer = true}});
+        sg_image img = texture();
+        sg_view data = sg_make_view(&(sg_view_desc){.storage_buffer.buffer = storage});
+        sg_view offset_data = sg_make_view(&(sg_view_desc){.storage_buffer = {.buffer = storage, .offset = 256}});
+        sg_view tex = sg_make_view(&(sg_view_desc){.texture.image = img});
+        sg_sampler sampler = sg_make_sampler(&(sg_sampler_desc){0});
+        _sg_pipeline_t pipelines[3] = {0};
+        for (int i = 0; i < 3; ++i) {
+            pipelines[i].slot.id = (uint32_t)i + 1;
+            pipelines[i].cmn.is_compute = is_compute;
+            pipelines[i].cmn.shader = _sg_shader_ref(_sg_lookup_shader(i == 2 ? empty.id : shader.id));
+            pipelines[i].wgpu.rpip = (WGPURenderPipeline)(uintptr_t)(i + 1);
+            pipelines[i].wgpu.cpip = (WGPUComputePipeline)(uintptr_t)(i + 1);
+        }
+        _sg_bindings_ptrs_t bnd = {.pip = &pipelines[0],
+            .views = {[0] = _sg_lookup_view(data.id), [4] = _sg_lookup_view(tex.id)},
+            .smps = {[2] = _sg_lookup_sampler(sampler.id)}};
+        _sg.cur_pass.is_compute = is_compute;
+        if (is_compute) _sg.wgpu.cpass_enc = (WGPUComputePassEncoder)1;
+        else _sg.wgpu.rpass_enc = (WGPURenderPassEncoder)1;
+        unsigned created = mock.group_creates, bound = mock.group_binds;
+        // Ground/flight/ground: one draw per frame, unchanged views and samplers.
+        for (int frame = 0; frame < 3; ++frame) {
+            _sg_wgpu_bindings_cache_clear();
+            bnd.pip = &pipelines[frame == 1];
+            _sg_wgpu_apply_pipeline(bnd.pip);
+            assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        }
+        printf("Same-shader A/B/A: %u resource group creates, %u binds (%s, stats %s)\n",
+            mock.group_creates - created, mock.group_binds - bound, is_compute ? "compute" : "render", profile ? "on" : "off");
+        fflush(stdout);
+        assert(mock.group_creates == created + 1 && mock.group_binds == bound + 3);
+        WGPUBindGroup shared = mock.bound_group;
+        bnd.pip = &pipelines[1];
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.bound_group == shared && mock.group_binds == bound + 3);
+        // Pipeline destruction leaves shader-owned groups available to its sibling.
+        _sg_wgpu_discard_pipeline(&pipelines[1]);
+        bnd.pip = &pipelines[0];
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.group_creates == created + 1);
+        sg_reset_state_cache();
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.group_binds == bound + 4 && mock.bound_group == shared);
+        _sg_wgpu_apply_pipeline(&pipelines[2]);
+        _sg_wgpu_apply_pipeline(&pipelines[0]);
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.group_binds == bound + 6 && mock.bound_group == shared);
+        assert(mock.group_creates == created + 1);
+
+        // Identical declarations in a different shader never share identity.
+        pipelines[1].cmn.shader = _sg_shader_ref(_sg_lookup_shader(other.id));
+        bnd.pip = &pipelines[1];
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.group_creates == created + 2 && mock.bound_group != shared);
+        bnd.pip = &pipelines[0];
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        shared = mock.bound_group;
+        created = mock.group_creates;
+
+        _sg_wgpu_bindgroups_cache_key_t original, changed;
+        _sg_wgpu_init_bindgroups_cache_key(&original, &bnd);
+        // Slots, generations and uninit/reinit generations all qualify the full tuple.
+        _sg_slot_t* slots[] = {&_sg_lookup_shader(shader.id)->slot, &bnd.views[0]->slot, &bnd.views[4]->slot, &bnd.smps[2]->slot};
+        for (size_t i = 0; i < sizeof slots / sizeof slots[0]; ++i) {
+            _sg_slot_t previous = *slots[i];
+            slots[i]->uninit_count++;
+            pipelines[0].cmn.shader = _sg_shader_ref(_sg_lookup_shader(shader.id));
+            _sg_wgpu_init_bindgroups_cache_key(&changed, &bnd);
+            changed.hash = original.hash; // Hash equality alone cannot authorize reuse.
+            assert(!_sg_wgpu_compare_bindgroups_cache_key(&original, &changed));
+            *slots[i] = previous;
+            pipelines[0].cmn.shader = _sg_shader_ref(_sg_lookup_shader(shader.id));
+        }
+
+        bnd.views[0] = _sg_lookup_view(offset_data.id);
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.group_creates == created + 1 && mock.bound_group != shared);
+        // Uninitializing a bound view retires its cached group before reusing the public ID.
+        sg_uninit_view(offset_data);
+        assert(_sg.wgpu.bindings_cache.bg.id == SG_INVALID_ID);
+        sg_init_view(offset_data, &(sg_view_desc){.storage_buffer = {.buffer = storage, .offset = 256}});
+        created = mock.group_creates;
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.group_creates == created + 1);
+        sg_uninit_sampler(sampler);
+        assert(_sg.wgpu.bindings_cache.bg.id == SG_INVALID_ID);
+        sg_init_sampler(sampler, &(sg_sampler_desc){0});
+        created = mock.group_creates;
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.group_creates == created + 1);
+
+        // Shader uninit must release every group it owns, including the bound group.
+        sg_uninit_shader(shader);
+        assert(_sg.wgpu.bindings_cache.bg.id == SG_INVALID_ID);
+        sg_init_shader(shader, &desc);
+        pipelines[0].cmn.shader = _sg_shader_ref(_sg_lookup_shader(shader.id));
+        created = mock.group_creates;
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.group_creates == created + 1);
+        sg_destroy_shader(shader);
+        assert(_sg.wgpu.bindings_cache.bg.id == SG_INVALID_ID);
+        sg_shader replacement = sg_make_shader(&desc);
+        assert(replacement.id != shader.id && _sg_slot_index(replacement.id) == _sg_slot_index(shader.id));
+        pipelines[0].cmn.shader = _sg_shader_ref(_sg_lookup_shader(replacement.id));
+        created = mock.group_creates;
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.group_creates == created + 1);
+        _sg.desc.wgpu.disable_bindgroups_cache = true;
+        created = mock.group_creates;
+        bound = mock.group_binds;
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(_sg_wgpu_apply_bindings_bindgroup(&bnd));
+        assert(mock.group_creates == created + 2 && mock.group_binds == bound + 2);
+        assert(_sg.wgpu.bindings_cache.bg.id == SG_INVALID_ID);
+        _sg.wgpu.rpass_enc = 0;
+        _sg.wgpu.cpass_enc = 0;
+        sg_destroy_shader(replacement); sg_destroy_shader(other); sg_destroy_shader(empty);
+        sg_destroy_sampler(sampler); sg_destroy_view(data); sg_destroy_view(offset_data); sg_destroy_view(tex);
+        check_shutdown();
+        assert(mock.group_creates == mock.group_releases);
+    }
 }
 static void test_unsealed_images(void) {
     setup(8);
@@ -473,8 +661,9 @@ static void test_unsealed_compressed_images(void) {
 }
 
 int main(void) {
+    test_binding_invalidation(); test_shader_binding_reuse(false); test_shader_binding_reuse(true);
     test_copy_and_reuse(); test_borrowed_failed_and_readback(); test_capacity_budget_and_shutdown();
     test_full_queue(); test_views_and_images(); test_sparse_uniforms_and_index_format();
     test_unsealed_images(); test_unsealed_compressed_images();
-    puts("Sokol WebGPU P1/P2: 8 lifetime, correctness and unsealed-image tests passed");
+    puts("Sokol WebGPU P1/P2/P3: lifetime, typed binding invalidation, shader reuse and unsealed-image tests passed");
 }
