@@ -11,6 +11,7 @@ static struct {
     int32_t vertex_base;
     uint64_t bytes;
     uint32_t pipelines, blends, stencils;
+    uint32_t uniform_offset, uniform_binds;
     WGPUColor blend_color;
     uint32_t stencil_ref;
     WGPUPassTimestampWrites timestamps[8];
@@ -41,11 +42,19 @@ void wgpuComputePassEncoderSetBindGroup(WGPUComputePassEncoder pass, uint32_t in
     (void)pass; (void)index; (void)count; (void)offsets;
     assert(group);
     calls.binds++;
+    if (index == 0 && count == 1) {
+        calls.uniform_offset = offsets[0];
+        calls.uniform_binds++;
+    }
 }
 void wgpuRenderPassEncoderSetBindGroup(WGPURenderPassEncoder pass, uint32_t index, WGPUBindGroup group, size_t count, const uint32_t* offsets) {
     (void)pass; (void)index; (void)count; (void)offsets;
     assert(group);
     calls.binds++;
+    if (index == 0 && count == 1) {
+        calls.uniform_offset = offsets[0];
+        calls.uniform_binds++;
+    }
 }
 void wgpuComputePassEncoderSetPipeline(WGPUComputePassEncoder pass, WGPUComputePipeline pipeline) { (void)pass; (void)pipeline; calls.pipelines++; }
 void wgpuRenderPassEncoderSetPipeline(WGPURenderPassEncoder pass, WGPURenderPipeline pipeline) { (void)pass; (void)pipeline; calls.pipelines++; }
@@ -94,6 +103,7 @@ static void reset(void) {
     memset(&_sg, 0, sizeof _sg);
     memset(&calls, 0, sizeof calls);
     _sg.valid = true;
+    _sg.uniform_cache_frame = 1;
     _sg.stats_enabled = true;
     _sg.wgpu.dev = (WGPUDevice)1;
     _sg.wgpu.queue = (WGPUQueue)1;
@@ -389,7 +399,136 @@ static void test_direct_instance_offsets(void) {
     assert(calls.draws == 5 && _sg.stats.cur_frame.num_draw_ex == 8);
 }
 
+static void test_uniform_reuse(void) {
+    for (int profiling = 0; profiling < 2; ++profiling) {
+        reset();
+        _sg.stats_enabled = profiling != 0;
+        sg_commit_listener listeners[1] = {0};
+        _sg.commit_listeners.items = listeners;
+        _sg_shader_t shaders[2] = {0};
+        _sg_pipeline_t pipelines[4] = {0};
+        for (int i = 0; i < 2; ++i) {
+            shaders[i].slot.id = (uint32_t)i + 1;
+            shaders[i].slot.state = SG_RESOURCESTATE_VALID;
+            shaders[i].cmn.required_bindings_and_uniforms = 1 << 3;
+            shaders[i].cmn.uniform_blocks[3].stage = SG_SHADERSTAGE_FRAGMENT;
+            shaders[i].cmn.uniform_blocks[3].size = 32;
+            shaders[i].wgpu.bg_ub = (WGPUBindGroup)1;
+            shaders[i].wgpu.bg_view_smp_empty = (WGPUBindGroup)2;
+            shaders[i].wgpu.ub_dynoffsets[3] = 0;
+            shaders[i].wgpu.ub_num_dynoffsets = 1;
+        }
+        for (int i = 1; i <= 3; ++i) {
+            pipelines[i].slot.id = (uint32_t)i;
+            pipelines[i].slot.state = SG_RESOURCESTATE_VALID;
+            pipelines[i].cmn.color_count = 1;
+            pipelines[i].cmn.index_type = SG_INDEXTYPE_NONE;
+            pipelines[i].cmn.shader = _sg_shader_ref(&shaders[i == 3]);
+            pipelines[i].cmn.required_bindings_and_uniforms = 1 << 3;
+            pipelines[i].wgpu.rpip = (WGPURenderPipeline)1;
+        }
+        _sg.pools.pipeline_pool.size = 4;
+        _sg.pools.pipelines = pipelines;
+        _sg.cur_pass.in_pass = _sg.cur_pass.valid = true;
+        _sg.wgpu.rpass_enc = (WGPURenderPassEncoder)1;
+        uint32_t data[8] = {1,2,3,4,5,6,7,8};
+        uint64_t data_id = sg_alloc_uniform_data_id();
+        sg_apply_pipeline((sg_pipeline){1});
+        sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
+        assert(_sg.wgpu.uniform.offset == 256);
+        sg_draw(0, 3, 1);
+        assert(calls.uniform_offset == 0);
+        // Same-shader raster variant, another shader, then the original.
+        for (int p = 2; p <= 3; ++p) {
+            sg_apply_pipeline((sg_pipeline){(uint32_t)p});
+            assert(_sg.applied_bindings_and_uniforms == 0);
+            sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
+            assert(_sg.applied_bindings_and_uniforms == (1 << 3));
+            sg_draw(0, 3, 1);
+        }
+        assert(_sg.wgpu.uniform.offset == 512 && calls.uniform_offset == 256);
+        sg_reset_state_cache();
+        sg_apply_pipeline((sg_pipeline){1});
+        sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
+        sg_draw(0, 3, 1);
+        assert(_sg.wgpu.uniform.offset == 512 && calls.uniform_offset == 0);
+        assert(calls.draws == 4 && calls.uniform_binds == 4);
+        // Temporary caller memory can change without changing earlier commands.
+        data[7] = 9;
+        data_id = sg_alloc_uniform_data_id();
+        sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
+        assert(_sg.wgpu.uniform.offset == 768);
+        assert(((uint32_t*)_sg.wgpu.uniform.staging)[7] == 8);
+        assert(((uint32_t*)(_sg.wgpu.uniform.staging + 512))[7] == 9);
+        sg_apply_uniforms(3, &SG_RANGE(data));
+        assert(_sg.wgpu.uniform.offset == 1024);
+        sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
+        assert(_sg.wgpu.uniform.offset == 1024 && _sg.wgpu.uniform.bind_offsets[3] == 512);
+        // A different sparse slot never aliases the cached slot.
+        shaders[0].cmn.uniform_blocks[5].stage = SG_SHADERSTAGE_FRAGMENT;
+        shaders[0].cmn.uniform_blocks[5].size = sizeof data;
+        sg_apply_uniforms_cached(5, &SG_RANGE(data), data_id);
+        assert(_sg.wgpu.uniform.offset == 1280);
+        shaders[0].cmn.uniform_blocks[5].stage = SG_SHADERSTAGE_NONE;
+        // Invalid size/slot/pass must retain ordinary validation and never cache.
+        sg_apply_uniforms_cached(3, &(sg_range){data, 16}, data_id);
+        assert(!_sg.next_draw_valid && _sg.wgpu.uniform.offset == 1280);
+        sg_apply_pipeline((sg_pipeline){1});
+        sg_apply_uniforms_cached(2, &SG_RANGE(data), data_id);
+        assert(!_sg.next_draw_valid && _sg.wgpu.uniform.offset == 1280);
+        _sg.cur_pass.valid = false;
+        sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
+        assert(_sg.wgpu.uniform.offset == 1280);
+        _sg.cur_pass.valid = true;
+        sg_apply_pipeline((sg_pipeline){1});
+        // A new pass in the same commit still rebinds its shader's group.
+        _sg_wgpu_end_pass(&(_sg_attachments_ptrs_t){.empty = true});
+        _sg_attachments_ptrs_t attachments = {.empty = true};
+        sg_pass render = {0};
+        render.swapchain.wgpu.render_view = (const void*)1;
+        render.action.colors[0].load_action = SG_LOADACTION_CLEAR;
+        render.action.colors[0].store_action = SG_STOREACTION_STORE;
+        _sg_wgpu_begin_pass(&render, &attachments);
+        sg_apply_pipeline((sg_pipeline){1});
+        sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
+        sg_draw(0, 3, 1);
+        assert(calls.uniform_offset == 512 && _sg.wgpu.uniform.offset == 1280);
+        sg_end_pass();
+        sg_commit();
+        assert(_sg.uniform_cache_frame == 2 && _sg.wgpu.uniform.offset == 0);
+        const sg_frame_stats stats = sg_query_stats().prev_frame;
+        if (profiling) {
+            assert(stats.num_apply_uniforms_cached == 11 && stats.num_apply_uniforms == 12);
+            assert(stats.num_reuse_uniforms == 4 && stats.size_reuse_uniforms == 128);
+            assert(stats.wgpu.uniforms.size_copy == 160);
+            assert(stats.wgpu.uniforms.size_unique == 128);
+            assert(stats.wgpu.uniforms.size_write_buffer == 1280);
+        } else {
+            assert(stats.num_reuse_uniforms == 0 && !_sg.wgpu.uniform.records);
+        }
+        _sg.cur_pass.in_pass = _sg.cur_pass.valid = true;
+        _sg_wgpu_begin_pass(&render, &attachments);
+        sg_apply_pipeline((sg_pipeline){1});
+        sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
+        assert(_sg.wgpu.uniform.offset == 256);
+        // Same public shader ID after uninit/reinit has no reusable range.
+        _sg_reset_shader_to_alloc_state(&shaders[0]);
+        shaders[0].slot.state = SG_RESOURCESTATE_VALID;
+        shaders[0].cmn.uniform_blocks[3].stage = SG_SHADERSTAGE_FRAGMENT;
+        shaders[0].cmn.uniform_blocks[3].size = sizeof data;
+        assert(shaders[0].cmn.uniform_blocks[3].cache_frame == 0);
+        assert(!_sg_validate_apply_uniforms(3, &SG_RANGE(data)));
+        pipelines[1].cmn.shader = _sg_shader_ref(&shaders[0]);
+        shaders[0].wgpu.bg_view_smp_empty = (WGPUBindGroup)2;
+        sg_apply_pipeline((sg_pipeline){1});
+        sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
+        assert(_sg.wgpu.uniform.offset == 512);
+    }
+}
+
+#if !defined(SLOPA_WGPU_STATS_NO_MAIN)
 int main(void) {
+    test_uniform_reuse();
     test_direct_instance_offsets();
     test_render_state_cache();
     test_padding();
@@ -397,5 +536,6 @@ int main(void) {
     test_real_pass_timestamps();
     test_external_frame_lifetime();
     test_unique_payloads_and_capacities();
-    puts("Sokol WebGPU instrumentation: 7 tests passed");
+    puts("Sokol WebGPU instrumentation: 8 tests passed");
 }
+#endif

@@ -4408,7 +4408,10 @@ typedef struct sg_frame_stats {
     uint32_t num_apply_scissor_rect;
     uint32_t num_apply_pipeline;
     uint32_t num_apply_bindings;
-    uint32_t num_apply_uniforms;
+    uint32_t num_apply_uniforms; // includes cached applies
+    uint32_t num_apply_uniforms_cached;
+    uint32_t num_reuse_uniforms;
+    uint32_t size_reuse_uniforms; // payload bytes reused, not ring allocation bytes
     uint32_t num_draw;
     uint32_t num_draw_ex;
     uint32_t num_dispatch;
@@ -5257,6 +5260,15 @@ SOKOL_GFX_API_DECL void sg_apply_scissor_rectf(float x, float y, float width, fl
 SOKOL_GFX_API_DECL void sg_apply_pipeline(sg_pipeline pip);
 SOKOL_GFX_API_DECL void sg_apply_bindings(const sg_bindings* bindings);
 SOKOL_GFX_API_DECL void sg_apply_uniforms(int ub_slot, const sg_range* data);
+/* Slopa immutable payload identity. No GPU resource or destroy operation.
+   Allocate a fresh ID whenever any payload byte changes; never reuse an ID for
+   different bytes or sizes. IDs may outlive a frame or sg_shutdown/sg_setup. */
+SOKOL_GFX_API_DECL uint64_t sg_alloc_uniform_data_id(void);
+/* Metal/WebGPU reuse the last cached upload for this shader/slot when ID and
+   commit match, otherwise copy data normally. Other backends always copy.
+   All ordinary validation, required-uniform flags and trace hooks still run.
+   No source pointer is retained. Caller owns the immutable-ID contract. */
+SOKOL_GFX_API_DECL void sg_apply_uniforms_cached(int ub_slot, const sg_range* data, uint64_t data_id);
 SOKOL_GFX_API_DECL void sg_draw(int base_element, int num_elements, int num_instances);
 SOKOL_GFX_API_DECL void sg_draw_ex(int base_element, int num_elements, int num_instances, int base_vertex, int base_instance);
 SOKOL_GFX_API_DECL void sg_dispatch(int num_groups_x, int num_groups_y, int num_groups_z);
@@ -5573,6 +5585,7 @@ inline void sg_write_image_unsealed(const sg_write_image_desc& desc) { sg_write_
 inline void sg_begin_pass(const sg_pass& pass) { return sg_begin_pass(&pass); }
 inline void sg_apply_bindings(const sg_bindings& bindings) { return sg_apply_bindings(&bindings); }
 inline void sg_apply_uniforms(int ub_slot, const sg_range& data) { return sg_apply_uniforms(ub_slot, &data); }
+inline void sg_apply_uniforms_cached(int ub_slot, const sg_range& data, uint64_t data_id) { return sg_apply_uniforms_cached(ub_slot, &data, data_id); }
 
 inline sg_buffer_desc sg_query_buffer_defaults(const sg_buffer_desc& desc) { return sg_query_buffer_defaults(&desc); }
 inline sg_image_desc sg_query_image_defaults(const sg_image_desc& desc) { return sg_query_image_defaults(&desc); }
@@ -6400,6 +6413,11 @@ typedef struct {
 typedef struct {
     sg_shader_stage stage;
     uint32_t size;
+    #if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+    uint64_t cache_frame;
+    uint64_t cache_data_id;
+    uint32_t cache_offset;
+    #endif
 } _sg_shader_uniform_block_t;
 
 typedef struct {
@@ -7462,6 +7480,7 @@ typedef struct {
     bool valid;
     sg_desc desc;       // original desc with default values patched in
     uint32_t frame_index;
+    uint64_t uniform_cache_frame;
     struct {
         bool valid;
         bool in_pass;
@@ -16803,6 +16822,31 @@ _SOKOL_PRIVATE bool _sg_mtl_apply_bindings(_sg_bindings_ptrs_t* bnd) {
     return true;
 }
 
+_SOKOL_PRIVATE void _sg_mtl_bind_uniforms(int ub_slot, uint32_t offset) {
+    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+    SOKOL_ASSERT(pip);
+    const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+
+    const sg_shader_stage stage = shd->cmn.uniform_blocks[ub_slot].stage;
+    const NSUInteger mtl_slot = shd->mtl.ub_buffer_n[ub_slot];
+
+    if (stage == SG_SHADERSTAGE_VERTEX) {
+        SOKOL_ASSERT(nil != _sg.mtl.render_cmd_encoder);
+        [_sg.mtl.render_cmd_encoder setVertexBufferOffset:(NSUInteger)offset atIndex:mtl_slot];
+        _sg_stats_inc(metal.uniforms.num_set_vertex_buffer_offset);
+    } else if (stage == SG_SHADERSTAGE_FRAGMENT) {
+        SOKOL_ASSERT(nil != _sg.mtl.render_cmd_encoder);
+        [_sg.mtl.render_cmd_encoder setFragmentBufferOffset:(NSUInteger)offset atIndex:mtl_slot];
+        _sg_stats_inc(metal.uniforms.num_set_fragment_buffer_offset);
+    } else if (stage == SG_SHADERSTAGE_COMPUTE) {
+        SOKOL_ASSERT(nil != _sg.mtl.compute_cmd_encoder);
+        [_sg.mtl.compute_cmd_encoder setBufferOffset:(NSUInteger)offset atIndex:mtl_slot];
+        _sg_stats_inc(metal.uniforms.num_set_compute_buffer_offset);
+    } else {
+        SOKOL_UNREACHABLE;
+    }
+}
+
 _SOKOL_PRIVATE void _sg_mtl_apply_uniforms(int ub_slot, const sg_range* data) {
     SOKOL_ASSERT((ub_slot >= 0) && (ub_slot < SG_MAX_UNIFORMBLOCK_BINDSLOTS));
     SOKOL_ASSERT(((size_t)_sg.mtl.cur_ub_offset + data->size) <= (size_t)_sg.mtl.ub_size);
@@ -16812,27 +16856,8 @@ _SOKOL_PRIVATE void _sg_mtl_apply_uniforms(int ub_slot, const sg_range* data) {
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
     SOKOL_ASSERT(data->size == shd->cmn.uniform_blocks[ub_slot].size);
 
-    const sg_shader_stage stage = shd->cmn.uniform_blocks[ub_slot].stage;
-    const NSUInteger mtl_slot = shd->mtl.ub_buffer_n[ub_slot];
-
-    // copy to global uniform buffer, record offset into cmd encoder, and advance offset
-    uint8_t* dst = &_sg.mtl.cur_ub_base_ptr[_sg.mtl.cur_ub_offset];
-    memcpy(dst, data->ptr, data->size);
-    if (stage == SG_SHADERSTAGE_VERTEX) {
-        SOKOL_ASSERT(nil != _sg.mtl.render_cmd_encoder);
-        [_sg.mtl.render_cmd_encoder setVertexBufferOffset:(NSUInteger)_sg.mtl.cur_ub_offset atIndex:mtl_slot];
-        _sg_stats_inc(metal.uniforms.num_set_vertex_buffer_offset);
-    } else if (stage == SG_SHADERSTAGE_FRAGMENT) {
-        SOKOL_ASSERT(nil != _sg.mtl.render_cmd_encoder);
-        [_sg.mtl.render_cmd_encoder setFragmentBufferOffset:(NSUInteger)_sg.mtl.cur_ub_offset atIndex:mtl_slot];
-        _sg_stats_inc(metal.uniforms.num_set_fragment_buffer_offset);
-    } else if (stage == SG_SHADERSTAGE_COMPUTE) {
-        SOKOL_ASSERT(nil != _sg.mtl.compute_cmd_encoder);
-        [_sg.mtl.compute_cmd_encoder setBufferOffset:(NSUInteger)_sg.mtl.cur_ub_offset atIndex:mtl_slot];
-        _sg_stats_inc(metal.uniforms.num_set_compute_buffer_offset);
-    } else {
-        SOKOL_UNREACHABLE;
-    }
+    memcpy(&_sg.mtl.cur_ub_base_ptr[_sg.mtl.cur_ub_offset], data->ptr, data->size);
+    _sg_mtl_bind_uniforms(ub_slot, (uint32_t)_sg.mtl.cur_ub_offset);
     _sg.mtl.cur_ub_offset = _sg_roundup(_sg.mtl.cur_ub_offset + (int)data->size, _SG_MTL_UB_ALIGN);
 }
 
@@ -25318,6 +25343,8 @@ _SOKOL_PRIVATE void _sg_override_portable_limits(void) {
 // ██       ██████  ██████  ███████ ██  ██████
 //
 // >>public
+static uint64_t _sg_uniform_data_id;
+
 SOKOL_API_IMPL void sg_setup(const sg_desc* desc) {
     SOKOL_ASSERT(!_sg.valid);
     SOKOL_ASSERT(desc);
@@ -25328,6 +25355,7 @@ SOKOL_API_IMPL void sg_setup(const sg_desc* desc) {
     _sg_setup_pools(&_sg.pools, &_sg.desc);
     _sg_setup_commit_listeners(&_sg.desc);
     _sg.frame_index = 1;
+    _sg.uniform_cache_frame = 1;
     _sg.stats_enabled = true;
     _sg_setup_backend(&_sg.desc);
     _sg_override_portable_limits();
@@ -26240,11 +26268,12 @@ SOKOL_API_IMPL void sg_apply_bindings(const sg_bindings* bindings) {
     }
 }
 
-SOKOL_API_IMPL void sg_apply_uniforms(int ub_slot, const sg_range* data) {
+_SOKOL_PRIVATE void _sg_apply_uniforms_checked(int ub_slot, const sg_range* data, uint64_t data_id) {
     SOKOL_ASSERT(_sg.valid);
     SOKOL_ASSERT((ub_slot >= 0) && (ub_slot < SG_MAX_UNIFORMBLOCK_BINDSLOTS));
     SOKOL_ASSERT(data && data->ptr && (data->size > 0));
     _sg_stats_inc(num_apply_uniforms);
+    if (data_id) { _sg_stats_inc(num_apply_uniforms_cached); }
     _sg_stats_add(size_apply_uniforms, (uint32_t)data->size);
     _SG_TRACE_ARGS(apply_uniforms, ub_slot, data);
     if (!_sg.cur_pass.valid) {
@@ -26258,7 +26287,50 @@ SOKOL_API_IMPL void sg_apply_uniforms(int ub_slot, const sg_range* data) {
     if (!_sg.next_draw_valid) {
         return;
     }
+    #if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+    if (data_id) {
+        const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+        _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+        _sg_shader_uniform_block_t* ub = &shd->cmn.uniform_blocks[ub_slot];
+        #if defined(SOKOL_METAL)
+        const uint32_t offset = (uint32_t)_sg.mtl.cur_ub_offset;
+        #else
+        const uint32_t offset = _sg.wgpu.uniform.offset;
+        #endif
+        if (ub->cache_frame == _sg.uniform_cache_frame && ub->cache_data_id == data_id
+            && ub->size == data->size && (uint64_t)ub->cache_offset + data->size <= offset) {
+            #if defined(SOKOL_METAL)
+            _sg_mtl_bind_uniforms(ub_slot, ub->cache_offset);
+            #else
+            _sg.wgpu.uniform.bind_offsets[ub_slot] = ub->cache_offset;
+            _sg.wgpu.uniform.dirty = true;
+            #endif
+            _sg_stats_inc(num_reuse_uniforms);
+            _sg_stats_add(size_reuse_uniforms, (uint32_t)data->size);
+            return;
+        }
+        _sg_apply_uniforms(ub_slot, data);
+        ub->cache_frame = _sg.uniform_cache_frame;
+        ub->cache_data_id = data_id;
+        ub->cache_offset = offset;
+        return;
+    }
+    #endif
     _sg_apply_uniforms(ub_slot, data);
+}
+
+SOKOL_API_IMPL void sg_apply_uniforms(int ub_slot, const sg_range* data) {
+    _sg_apply_uniforms_checked(ub_slot, data, 0);
+}
+
+SOKOL_API_IMPL uint64_t sg_alloc_uniform_data_id(void) {
+    SOKOL_ASSERT(_sg.valid && _sg_uniform_data_id != UINT64_MAX);
+    return ++_sg_uniform_data_id;
+}
+
+SOKOL_API_IMPL void sg_apply_uniforms_cached(int ub_slot, const sg_range* data, uint64_t data_id) {
+    SOKOL_ASSERT(data_id > 0 && data_id <= _sg_uniform_data_id);
+    _sg_apply_uniforms_checked(ub_slot, data, data_id);
 }
 
 _SOKOL_PRIVATE bool _sg_check_skip_draw(int num_elements, int num_instances) {
@@ -26350,6 +26422,7 @@ SOKOL_API_IMPL void sg_commit(void) {
     _sg_notify_commit_listeners();
     _SG_TRACE_NOARGS(commit);
     _sg.frame_index++;
+    _sg.uniform_cache_frame++;
 }
 
 SOKOL_API_IMPL void sg_reset_state_cache(void) {
