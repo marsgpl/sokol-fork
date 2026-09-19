@@ -18364,6 +18364,24 @@ _SOKOL_PRIVATE void _sg_wgpu_reset_state_cache(void) {
     _sg.wgpu.render_state_cache.is_valid = false;
 }
 
+#if defined(__EMSCRIPTEN__)
+// Avoid a temporary Wasm mapping and its full-size memcpy. Mapping offsets need 8-byte alignment; sizes need 4.
+_SOKOL_PRIVATE WGPUStatus _sg_wgpu_write_initial_buffer(WGPUBuffer buffer, const sg_range* data) {
+    const size_t tail_size = (data->size & 3) ? (data->size & 7) : 0;
+    const size_t prefix_size = data->size - tail_size;
+    if (prefix_size > 0) {
+        WGPUStatus status = wgpuBufferWriteMappedRange(buffer, 0, data->ptr, prefix_size);
+        if (status != WGPUStatus_Success) { return status; }
+    }
+    if (tail_size > 0) {
+        uint8_t tail[8] = { 0 };
+        memcpy(tail, (const uint8_t*)data->ptr + prefix_size, tail_size);
+        return wgpuBufferWriteMappedRange(buffer, prefix_size, tail, (tail_size + 3) & ~(size_t)3);
+    }
+    return WGPUStatus_Success;
+}
+#endif
+
 _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_buffer(_sg_buffer_t* buf, const sg_buffer_desc* desc) {
     SOKOL_ASSERT(buf && desc);
     SOKOL_ASSERT(buf->cmn.size > 0);
@@ -18392,12 +18410,19 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_buffer(_sg_buffer_t* buf, const
         if (map_at_creation) {
             SOKOL_ASSERT(desc->data.ptr && (desc->data.size > 0));
             SOKOL_ASSERT(desc->data.size <= (size_t)buf->cmn.size);
-            // FIXME: inefficient on WASM
+            #if defined(__EMSCRIPTEN__)
+            WGPUStatus status = _sg_wgpu_write_initial_buffer(buf->wgpu.buf, &desc->data);
+            SOKOL_ASSERT(status == WGPUStatus_Success);
+            #else
             void* ptr = wgpuBufferGetMappedRange(buf->wgpu.buf, 0, wgpu_buf_size);
             SOKOL_ASSERT(ptr);
             memcpy(ptr, desc->data.ptr, desc->data.size);
+            #endif
             _sg_stats_add(wgpu.transfers.size_memcpy, desc->data.size);
             wgpuBufferUnmap(buf->wgpu.buf);
+            #if defined(__EMSCRIPTEN__)
+            if (status != WGPUStatus_Success) { return SG_RESOURCESTATE_FAILED; }
+            #endif
         }
     }
     return SG_RESOURCESTATE_VALID;
