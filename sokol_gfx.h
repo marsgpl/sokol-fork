@@ -2232,6 +2232,7 @@ typedef struct sg_features {
     bool separate_buffer_types;         // cannot use the same buffer for vertex and indices (only WebGL2)
     bool draw_base_vertex;              // draw with (base vertex > 0) && (base_instance == 0) supported
     bool draw_base_instance;            // draw with (base instance > 0) supported
+    bool indirect_draw;                 // indexed/non-indexed indirect draws (Metal/WebGPU)
     bool dual_source_blending;          // dual-source-blending supported
     bool vertexformat_int10_n2;         // SG_VERTEXFORMAT_INT10_N2 is supported
     bool gl_texture_views;              // supports 'proper' texture views (GL 4.3+)
@@ -3186,6 +3187,9 @@ typedef struct sg_bindings {
     .storage_buffer (default: false)
         the buffer will be bound as storage buffer via storage-buffer-view
         in sg_bindings.views[]
+    .indirect_buffer (default: false)
+        draw arguments for sg_draw_indirect / sg_draw_indexed_indirect.
+        Combine with storage_buffer for compute-written arguments.
     .immutable (default: true)
         the buffer content will never be updated from the CPU side (but
         may be written to by a compute shader)
@@ -3209,6 +3213,7 @@ typedef struct sg_buffer_usage {
     bool vertex_buffer;
     bool index_buffer;
     bool storage_buffer;
+    bool indirect_buffer;
     bool immutable;
     bool dynamic_update;
     bool stream_update;
@@ -4090,6 +4095,8 @@ typedef struct sg_trace_hooks {
     void (*apply_uniforms)(int ub_index, const sg_range* data, void* user_data);
     void (*draw)(int base_element, int num_elements, int num_instances, void* user_data);
     void (*draw_ex)(int base_element, int num_elements, int num_instances, int base_vertex, int base_instance, void* user_data);
+    void (*draw_indirect)(sg_buffer arguments, size_t offset_bytes, void* user_data);
+    void (*draw_indexed_indirect)(sg_buffer arguments, size_t offset_bytes, void* user_data);
     void (*dispatch)(int num_groups_x, int num_groups_y, int num_groups_z, void* user_data);
     void (*end_pass)(void* user_data);
     void (*commit)(void* user_data);
@@ -4421,6 +4428,8 @@ typedef struct sg_frame_stats {
     uint32_t size_reuse_uniforms; // payload bytes reused, not ring allocation bytes
     uint32_t num_draw;
     uint32_t num_draw_ex;
+    uint32_t num_draw_indirect;          // encoded commands, including GPU-zero counts
+    uint32_t num_draw_indexed_indirect;  // encoded commands, including GPU-zero counts
     uint32_t num_dispatch;
     uint32_t num_update_buffer;
     uint32_t num_append_buffer;
@@ -4668,6 +4677,8 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(VALIDATE_BUFFERDESC_EXPECT_ZERO_DATA_SIZE, "sg_buffer_desc.data.size expected to be zero") \
     _SG_LOGITEM_XMACRO(VALIDATE_BUFFERDESC_EXPECT_NO_DATA, "sg_buffer_desc.data.ptr must be null for dynamic/stream buffers") \
     _SG_LOGITEM_XMACRO(VALIDATE_BUFFERDESC_EXPECT_DATA, "sg_buffer_desc: initial content data must be provided for immutable buffers without storage buffer usage") \
+    _SG_LOGITEM_XMACRO(VALIDATE_BUFFERDESC_INDIRECT_SUPPORTED, "indirect buffers require sg_features.indirect_draw") \
+    _SG_LOGITEM_XMACRO(VALIDATE_BUFFERDESC_INDIRECT_SIZE, "indirect buffer size must be a multiple of four") \
     _SG_LOGITEM_XMACRO(VALIDATE_BUFFERDESC_STORAGEBUFFER_SUPPORTED, "storage buffers not supported by the backend 3D API (requires OpenGL >= 4.3)") \
     _SG_LOGITEM_XMACRO(VALIDATE_BUFFERDESC_STORAGEBUFFER_SIZE_MULTIPLE_4, "size of storage buffers must be a multiple of 4") \
     _SG_LOGITEM_XMACRO(VALIDATE_IMAGEDATA_NODATA, "sg_image_data: no data (.ptr and/or .size is zero)") \
@@ -4949,6 +4960,12 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_NUMELEMENTS_GE_ZERO, "sg_draw: num_elements cannot be < 0") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_NUMINSTANCES_GE_ZERO, "sg_draw: num_instances cannot be < 0") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_EX_RENDERPASS_EXPECTED, "sg_draw: must be called in a render pass") \
+    _SG_LOGITEM_XMACRO(VALIDATE_DRAW_INDIRECT_SUPPORTED, "indirect draws require sg_features.indirect_draw") \
+    _SG_LOGITEM_XMACRO(VALIDATE_DRAW_INDIRECT_BUFFER, "indirect draw requires a live, valid argument buffer") \
+    _SG_LOGITEM_XMACRO(VALIDATE_DRAW_INDIRECT_USAGE, "indirect argument buffer requires indirect_buffer usage") \
+    _SG_LOGITEM_XMACRO(VALIDATE_DRAW_INDIRECT_OFFSET, "indirect argument offset must be four-byte aligned and in bounds") \
+    _SG_LOGITEM_XMACRO(VALIDATE_DRAW_INDIRECT_PIPELINE, "indirect draw requires a live graphics pipeline and shader") \
+    _SG_LOGITEM_XMACRO(VALIDATE_DRAW_INDIRECT_INDEXED, "indirect draw API must match the pipeline index type") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_EX_BASEELEMENT_GE_ZERO, "sg_draw_ex: base_element cannot be < 0") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_EX_NUMELEMENTS_GE_ZERO, "sg_draw_ex: num_elements cannot be < 0") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_EX_NUMINSTANCES_GE_ZERO, "sg_draw_ex: num_instances cannot be < 0") \
@@ -5281,6 +5298,20 @@ SOKOL_GFX_API_DECL uint64_t sg_alloc_uniform_data_id(void);
 SOKOL_GFX_API_DECL void sg_apply_uniforms_cached(int ub_slot, const sg_range* data, uint64_t data_id);
 SOKOL_GFX_API_DECL void sg_draw(int base_element, int num_elements, int num_instances);
 SOKOL_GFX_API_DECL void sg_draw_ex(int base_element, int num_elements, int num_instances, int base_vertex, int base_instance);
+// Portable argument layouts: first_instance must be zero on WebGPU without its optional feature.
+typedef struct sg_draw_indirect_args {
+    uint32_t vertex_count, instance_count, first_vertex, first_instance;
+} sg_draw_indirect_args;
+
+typedef struct sg_draw_indexed_indirect_args {
+    uint32_t index_count, instance_count, first_index;
+    int32_t base_vertex;
+    uint32_t first_instance;
+} sg_draw_indexed_indirect_args;
+
+// Offset is 4-byte aligned. Indexed first_index is relative to sg_bindings.index_buffer_offset.
+SOKOL_GFX_API_DECL void sg_draw_indirect(sg_buffer arguments, size_t offset_bytes);
+SOKOL_GFX_API_DECL void sg_draw_indexed_indirect(sg_buffer arguments, size_t offset_bytes);
 SOKOL_GFX_API_DECL void sg_dispatch(int num_groups_x, int num_groups_y, int num_groups_z);
 SOKOL_GFX_API_DECL void sg_end_pass(void);
 SOKOL_GFX_API_DECL void sg_commit(void);
@@ -15334,6 +15365,7 @@ _SOKOL_PRIVATE void _sg_mtl_init_caps(void) {
     _sg.features.mrt_independent_blend_state = true;
     _sg.features.mrt_independent_write_mask = true;
     _sg.features.compute = true;
+    _sg.features.indirect_draw = true;
     _sg.features.msaa_texture_bindings = true;
     _sg.features.draw_base_vertex = true;
     _sg.features.draw_base_instance = true;
@@ -16900,6 +16932,26 @@ _SOKOL_PRIVATE void _sg_mtl_draw(int base_element, int num_elements, int num_ins
     }
 }
 
+_SOKOL_PRIVATE void _sg_mtl_draw_indirect(const _sg_buffer_t* args, size_t offset, bool is_indexed) {
+    SOKOL_ASSERT(_sg.mtl.render_cmd_encoder && args);
+    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+    SOKOL_ASSERT(pip);
+    id<MTLBuffer> argument_buffer = _sg_mtl_id(args->mtl.buf[args->cmn.active_slot]);
+    SOKOL_ASSERT(argument_buffer);
+    if (is_indexed) {
+        const _sg_buffer_t* ib = _sg_buffer_ref_ptr(&_sg.mtl.cache.cur_ibuf);
+        SOKOL_ASSERT(ib);
+        [_sg.mtl.render_cmd_encoder drawIndexedPrimitives:pip->mtl.prim_type
+            indexType:pip->mtl.index_type
+            indexBuffer:_sg_mtl_id(ib->mtl.buf[ib->cmn.active_slot])
+            indexBufferOffset:(NSUInteger)_sg.mtl.cache.cur_ibuf_offset
+            indirectBuffer:argument_buffer indirectBufferOffset:(NSUInteger)offset];
+    } else {
+        [_sg.mtl.render_cmd_encoder drawPrimitives:pip->mtl.prim_type
+            indirectBuffer:argument_buffer indirectBufferOffset:(NSUInteger)offset];
+    }
+}
+
 _SOKOL_PRIVATE void _sg_mtl_dispatch(int num_groups_x, int num_groups_y, int num_groups_z) {
     SOKOL_ASSERT(nil != _sg.mtl.compute_cmd_encoder);
     const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
@@ -17016,6 +17068,9 @@ _SOKOL_PRIVATE WGPUBufferUsage _sg_wgpu_buffer_usage(const sg_buffer_usage* usg)
     }
     if (usg->storage_buffer) {
         res |= (int)WGPUBufferUsage_Storage;
+    }
+    if (usg->indirect_buffer) {
+        res |= (int)WGPUBufferUsage_Indirect;
     }
     if (!usg->immutable) {
         res |= (int)WGPUBufferUsage_CopyDst;
@@ -17410,6 +17465,7 @@ _SOKOL_PRIVATE void _sg_wgpu_init_caps(void) {
     _sg.features.mrt_independent_blend_state = true;
     _sg.features.mrt_independent_write_mask = true;
     _sg.features.compute = true;
+    _sg.features.indirect_draw = true;
     _sg.features.msaa_texture_bindings = true;
     _sg.features.draw_base_vertex = true;
     _sg.features.draw_base_instance = true;
@@ -19352,6 +19408,18 @@ _SOKOL_PRIVATE void _sg_wgpu_draw(int base_element, int num_elements, int num_in
             (uint32_t)num_instances,
             (uint32_t)base_element,
             (uint32_t)base_instance);
+    }
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_draw_indirect(const _sg_buffer_t* args, size_t offset, bool is_indexed) {
+    SOKOL_ASSERT(_sg.wgpu.rpass_enc && args && args->wgpu.buf);
+    if (_sg.wgpu.uniform.dirty) {
+        _sg_wgpu_uniform_system_set_bindgroup();
+    }
+    if (is_indexed) {
+        wgpuRenderPassEncoderDrawIndexedIndirect(_sg.wgpu.rpass_enc, args->wgpu.buf, offset);
+    } else {
+        wgpuRenderPassEncoderDrawIndirect(_sg.wgpu.rpass_enc, args->wgpu.buf, offset);
     }
 }
 
@@ -22924,6 +22992,19 @@ static inline void _sg_draw(int base_element, int num_elements, int num_instance
     #endif
 }
 
+static inline void _sg_draw_indirect(const _sg_buffer_t* args, size_t offset, bool is_indexed) {
+    #if defined(SOKOL_METAL)
+    _sg_mtl_draw_indirect(args, offset, is_indexed);
+    #elif defined(SOKOL_WGPU)
+    _sg_wgpu_draw_indirect(args, offset, is_indexed);
+    #else
+    _SOKOL_UNUSED(args);
+    _SOKOL_UNUSED(offset);
+    _SOKOL_UNUSED(is_indexed);
+    SOKOL_UNREACHABLE;
+    #endif
+}
+
 static inline void _sg_dispatch(int num_groups_x, int num_groups_y, int num_groups_z) {
     #if defined(_SOKOL_ANY_GL)
     _sg_gl_dispatch(num_groups_x, num_groups_y, num_groups_z);
@@ -23089,6 +23170,10 @@ _SOKOL_PRIVATE bool _sg_validate_buffer_desc(const sg_buffer_desc* desc) {
         } else {
             _SG_VALIDATE(0 == desc->data.ptr, VALIDATE_BUFFERDESC_EXPECT_NO_DATA);
             _SG_VALIDATE(desc->data.size == 0, VALIDATE_BUFFERDESC_EXPECT_ZERO_DATA_SIZE);
+        }
+        if (desc->usage.indirect_buffer) {
+            _SG_VALIDATE(_sg.features.indirect_draw, VALIDATE_BUFFERDESC_INDIRECT_SUPPORTED);
+            _SG_VALIDATE(_sg_multiple_u64(desc->size, 4), VALIDATE_BUFFERDESC_INDIRECT_SIZE);
         }
         if (desc->usage.storage_buffer) {
             _SG_VALIDATE(_sg.features.compute, VALIDATE_BUFFERDESC_STORAGEBUFFER_SUPPORTED);
@@ -24537,6 +24622,40 @@ _SOKOL_PRIVATE bool _sg_validate_draw_ex(int base_element, int num_elements, int
     #endif
 }
 
+_SOKOL_PRIVATE bool _sg_validate_draw_indirect(const _sg_buffer_t* args, size_t offset, bool is_indexed) {
+    #if !defined(SOKOL_DEBUG)
+        _SOKOL_UNUSED(args);
+        _SOKOL_UNUSED(offset);
+        _SOKOL_UNUSED(is_indexed);
+        return true;
+    #else
+        if (_sg.desc.disable_validation) {
+            return true;
+        }
+        _sg_validate_begin();
+        _SG_VALIDATE(_sg.features.indirect_draw, VALIDATE_DRAW_INDIRECT_SUPPORTED);
+        _SG_VALIDATE(_sg.cur_pass.in_pass && !_sg.cur_pass.is_compute, VALIDATE_DRAW_RENDERPASS_EXPECTED);
+        const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr_or_null(&_sg.cur_pip);
+        const bool is_pipeline_valid = pip && pip->slot.state == SG_RESOURCESTATE_VALID
+            && _sg_shader_ref_alive(&pip->cmn.shader)
+            && _sg_shader_ref_ptr(&pip->cmn.shader)->slot.state == SG_RESOURCESTATE_VALID;
+        _SG_VALIDATE(is_pipeline_valid, VALIDATE_DRAW_INDIRECT_PIPELINE);
+        if (is_pipeline_valid) {
+            _SG_VALIDATE(!pip->cmn.is_compute, VALIDATE_DRAW_INDIRECT_PIPELINE);
+            _SG_VALIDATE(is_indexed == (pip->cmn.index_type != SG_INDEXTYPE_NONE), VALIDATE_DRAW_INDIRECT_INDEXED);
+        }
+        _SG_VALIDATE(args && args->slot.state == SG_RESOURCESTATE_VALID, VALIDATE_DRAW_INDIRECT_BUFFER);
+        if (args && args->slot.state == SG_RESOURCESTATE_VALID) {
+            const size_t size = is_indexed ? sizeof(sg_draw_indexed_indirect_args) : sizeof(sg_draw_indirect_args);
+            _SG_VALIDATE(args->cmn.usage.indirect_buffer, VALIDATE_DRAW_INDIRECT_USAGE);
+            _SG_VALIDATE((offset & 3) == 0 && offset <= (size_t)args->cmn.size
+                && size <= (size_t)args->cmn.size - offset, VALIDATE_DRAW_INDIRECT_OFFSET);
+        }
+        _SG_VALIDATE(_sg.required_bindings_and_uniforms == _sg.applied_bindings_and_uniforms, VALIDATE_DRAW_REQUIRED_BINDINGS_OR_UNIFORMS_MISSING);
+        return _sg_validate_end();
+    #endif
+}
+
 _SOKOL_PRIVATE bool _sg_validate_dispatch(int num_groups_x, int num_groups_y, int num_groups_z) {
     #if !defined(SOKOL_DEBUG)
         _SOKOL_UNUSED(num_groups_x);
@@ -24757,7 +24876,7 @@ _SOKOL_PRIVATE bool _sg_validate_pass_attachment_limits(const sg_pass* pass) {
 // >>resources
 _SOKOL_PRIVATE sg_buffer_usage _sg_buffer_usage_defaults(const sg_buffer_usage* usg) {
     sg_buffer_usage def = *usg;
-    if (!(def.vertex_buffer || def.index_buffer || def.storage_buffer)) {
+    if (!(def.vertex_buffer || def.index_buffer || def.storage_buffer || def.indirect_buffer)) {
         def.vertex_buffer = true;
     }
     if (!(def.immutable || def.stream_update || def.dynamic_update)) {
@@ -26461,6 +26580,34 @@ SOKOL_API_IMPL void sg_draw_ex(int base_element, int num_elements, int num_insta
     }
     #endif
     _sg_draw(base_element, num_elements, num_instances, base_vertex, base_instance);
+}
+
+_SOKOL_PRIVATE void _sg_draw_indirect_checked(sg_buffer arguments, size_t offset_bytes, bool is_indexed) {
+    SOKOL_ASSERT(_sg.valid);
+    const _sg_buffer_t* args = _sg_lookup_buffer(arguments.id);
+    if (!_sg_validate_draw_indirect(args, offset_bytes, is_indexed)) {
+        return;
+    }
+    if (!_sg.cur_pass.valid || !_sg.next_draw_valid) {
+        return;
+    }
+    SOKOL_ASSERT(args && args->slot.state == SG_RESOURCESTATE_VALID);
+    if (is_indexed) {
+        _sg_stats_inc(num_draw_indexed_indirect);
+    } else {
+        _sg_stats_inc(num_draw_indirect);
+    }
+    _sg_draw_indirect(args, offset_bytes, is_indexed);
+}
+
+SOKOL_API_IMPL void sg_draw_indirect(sg_buffer arguments, size_t offset_bytes) {
+    _SG_TRACE_ARGS(draw_indirect, arguments, offset_bytes);
+    _sg_draw_indirect_checked(arguments, offset_bytes, false);
+}
+
+SOKOL_API_IMPL void sg_draw_indexed_indirect(sg_buffer arguments, size_t offset_bytes) {
+    _SG_TRACE_ARGS(draw_indexed_indirect, arguments, offset_bytes);
+    _sg_draw_indirect_checked(arguments, offset_bytes, true);
 }
 
 SOKOL_API_IMPL void sg_dispatch(int num_groups_x, int num_groups_y, int num_groups_z) {
