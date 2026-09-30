@@ -3081,6 +3081,12 @@ typedef struct sg_pass {
     sg_attachments attachments;
     sg_swapchain swapchain;
     const char* label;
+    // Slopa: optional stage-boundary counters, borrowed until command completion.
+    struct {
+        const void* sample_buffer;
+        uint32_t sample_index; // render: vertex start/end, fragment start/end; compute: start/end
+        bool defer_present; // keep a split swapchain drawable until commit
+    } metal;
     uint32_t _end_canary;
 } sg_pass;
 
@@ -7047,6 +7053,7 @@ typedef struct {
     id<MTLRenderCommandEncoder> render_cmd_encoder;
     id<MTLComputeCommandEncoder> compute_cmd_encoder;
     id<CAMetalDrawable> cur_drawable;
+    id<CAMetalDrawable> deferred_drawable;
     id<MTLBuffer> uniform_buffers[SG_NUM_INFLIGHT_FRAMES];
     _sg_mtl_async_t* async;             // Slopa: in-flight compiles, main thread only
     dispatch_group_t async_group;       // Slopa: outstanding completion handlers, awaited at shutdown
@@ -16596,7 +16603,15 @@ _SOKOL_PRIVATE void _sg_mtl_begin_compute_pass(const sg_pass* pass) {
     SOKOL_ASSERT(nil == _sg.mtl.compute_cmd_encoder);
     SOKOL_ASSERT(nil == _sg.mtl.render_cmd_encoder);
 
-    _sg.mtl.compute_cmd_encoder = [_sg.mtl.cmd_buffer computeCommandEncoder];
+    if (pass->metal.sample_buffer) {
+        MTLComputePassDescriptor* desc = [MTLComputePassDescriptor computePassDescriptor];
+        desc.sampleBufferAttachments[0].sampleBuffer = (__bridge id<MTLCounterSampleBuffer>)pass->metal.sample_buffer;
+        desc.sampleBufferAttachments[0].startOfEncoderSampleIndex = pass->metal.sample_index;
+        desc.sampleBufferAttachments[0].endOfEncoderSampleIndex = pass->metal.sample_index + 1;
+        _sg.mtl.compute_cmd_encoder = [_sg.mtl.cmd_buffer computeCommandEncoderWithDescriptor:desc];
+    } else {
+        _sg.mtl.compute_cmd_encoder = [_sg.mtl.cmd_buffer computeCommandEncoder];
+    }
     if (nil == _sg.mtl.compute_cmd_encoder) {
         _sg.cur_pass.valid = false;
         return;
@@ -16620,6 +16635,14 @@ _SOKOL_PRIVATE void _sg_mtl_begin_render_pass(const sg_pass* pass, const _sg_att
 
     MTLRenderPassDescriptor* pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
     SOKOL_ASSERT(pass_desc);
+    if (pass->metal.sample_buffer) {
+        MTLRenderPassSampleBufferAttachmentDescriptor* sample = pass_desc.sampleBufferAttachments[0];
+        sample.sampleBuffer = (__bridge id<MTLCounterSampleBuffer>)pass->metal.sample_buffer;
+        sample.startOfVertexSampleIndex = pass->metal.sample_index;
+        sample.endOfVertexSampleIndex = pass->metal.sample_index + 1;
+        sample.startOfFragmentSampleIndex = pass->metal.sample_index + 2;
+        sample.endOfFragmentSampleIndex = pass->metal.sample_index + 3;
+    }
     if (!atts->empty) {
         // setup pass descriptor for offscreen rendering
         for (NSUInteger i = 0; i < (NSUInteger)atts->num_color_views; i++) {
@@ -16719,13 +16742,18 @@ _SOKOL_PRIVATE void _sg_mtl_begin_render_pass(const sg_pass* pass, const _sg_att
         _sg_mtl_release_resource(_sg.frame_index, pass_desc_ref);
 
         _sg.mtl.cur_drawable = (__bridge id<CAMetalDrawable>) swapchain->metal.current_drawable;
+        if (pass->metal.defer_present) {
+            SOKOL_ASSERT(!_sg.mtl.deferred_drawable || _sg.mtl.deferred_drawable == _sg.mtl.cur_drawable);
+            _sg.mtl.deferred_drawable = _sg.mtl.cur_drawable;
+        }
         if (swapchain->sample_count > 1) {
             // multi-sampling: render into msaa texture, resolve into drawable texture
             id<MTLTexture> msaa_tex = (__bridge id<MTLTexture>) swapchain->metal.msaa_color_texture;
             SOKOL_ASSERT(msaa_tex != nil);
             pass_desc.colorAttachments[0].texture = msaa_tex;
             pass_desc.colorAttachments[0].resolveTexture = _sg.mtl.cur_drawable.texture;
-            pass_desc.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+            pass_desc.colorAttachments[0].storeAction = pass->metal.defer_present
+                ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionMultisampleResolve;
         } else {
             // non-msaa: render into current_drawable
             pass_desc.colorAttachments[0].texture = _sg.mtl.cur_drawable.texture;
@@ -16740,12 +16768,14 @@ _SOKOL_PRIVATE void _sg_mtl_begin_render_pass(const sg_pass* pass, const _sg_att
             id<MTLTexture> ds_tex = (__bridge id<MTLTexture>) swapchain->metal.depth_stencil_texture;
             SOKOL_ASSERT(ds_tex != nil);
             pass_desc.depthAttachment.texture = ds_tex;
-            pass_desc.depthAttachment.storeAction = MTLStoreActionDontCare;
+            pass_desc.depthAttachment.storeAction = pass->metal.defer_present
+                ? _sg_mtl_store_action(action->depth.store_action, false) : MTLStoreActionDontCare;
             pass_desc.depthAttachment.loadAction = _sg_mtl_load_action(action->depth.load_action);
             pass_desc.depthAttachment.clearDepth = action->depth.clear_value;
             if (_sg_is_depth_stencil_format(swapchain->depth_format)) {
                 pass_desc.stencilAttachment.texture = ds_tex;
-                pass_desc.stencilAttachment.storeAction = MTLStoreActionDontCare;
+                pass_desc.stencilAttachment.storeAction = pass->metal.defer_present
+                    ? _sg_mtl_store_action(action->stencil.store_action, false) : MTLStoreActionDontCare;
                 pass_desc.stencilAttachment.loadAction = _sg_mtl_load_action(action->stencil.load_action);
                 pass_desc.stencilAttachment.clearStencil = action->stencil.clear_value;
             }
@@ -16832,7 +16862,9 @@ _SOKOL_PRIVATE void _sg_mtl_end_pass(const _sg_attachments_ptrs_t* atts) {
     }
     // if this is a swapchain pass, present the drawable
     if (nil != _sg.mtl.cur_drawable) {
-        [_sg.mtl.cmd_buffer presentDrawable:_sg.mtl.cur_drawable];
+        if (_sg.mtl.cur_drawable != _sg.mtl.deferred_drawable) {
+            [_sg.mtl.cmd_buffer presentDrawable:_sg.mtl.cur_drawable];
+        }
         _sg.mtl.cur_drawable = nil;
     }
 }
@@ -16843,6 +16875,10 @@ _SOKOL_PRIVATE void _sg_mtl_commit(void) {
 
     // commit the frame's command buffer
     if (_sg.mtl.cmd_buffer) {
+        if (_sg.mtl.deferred_drawable) {
+            [_sg.mtl.cmd_buffer presentDrawable:_sg.mtl.deferred_drawable];
+            _sg.mtl.deferred_drawable = nil;
+        }
         [_sg.mtl.cmd_buffer commit];
     }
 
