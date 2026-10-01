@@ -324,10 +324,10 @@ static void test_views_and_images(void) {
     _sg_wgpu_bindgroup_t* bg = _sg_wgpu_lookup_bindgroup(id.id);
     bg->slot.state = SG_RESOURCESTATE_VALID; bg->bindgroup = (WGPUBindGroup)1;
     bg->key.items[1] = _sg_wgpu_bindgroups_cache_view_item(7, &view->slot);
-    _sg_wgpu_bindgroups_cache_set(1, id.id); _sg.wgpu.bindings_cache.bg = id;
+    _sg_wgpu_bindgroups_cache_promote(_sg_wgpu_bindgroups_cache_ways(1), 0, id.id); _sg.wgpu.bindings_cache.bg = id;
     begin(); _sg.wgpu.cmd_enc->texture = old;
     sg_uninit_image(img);
-    assert(_sg_wgpu_bindgroups_cache_get(1) == SG_INVALID_ID && _sg.wgpu.bindings_cache.bg.id == SG_INVALID_ID);
+    assert(_sg_wgpu_bindgroups_cache_ways(1)[0].id == SG_INVALID_ID && _sg.wgpu.bindings_cache.bg.id == SG_INVALID_ID);
     assert(mock.group_releases == 1 && !old->destroyed);
     assert(sg_query_stats().wgpu_memory.retired_image_bytes == 256);
     sg_init_image(img, &(sg_image_desc){.width = 8, .height = 8, .usage.dynamic_update = true});
@@ -354,9 +354,9 @@ static void test_views_and_images(void) {
     id = _sg_wgpu_alloc_bindgroup(); bg = _sg_wgpu_lookup_bindgroup(id.id);
     bg->slot.state = SG_RESOURCESTATE_VALID; bg->bindgroup = (WGPUBindGroup)1;
     bg->key.items[1] = _sg_wgpu_bindgroups_cache_view_item(3, &storage_view->slot);
-    _sg_wgpu_bindgroups_cache_set(1, id.id);
+    _sg_wgpu_bindgroups_cache_promote(_sg_wgpu_bindgroups_cache_ways(1), 0, id.id);
     sg_destroy_buffer(storage);
-    assert(_sg_wgpu_bindgroups_cache_get(1) == SG_INVALID_ID);
+    assert(_sg_wgpu_bindgroups_cache_ways(1)[0].id == SG_INVALID_ID);
     assert(!_sg_buffer_ref_valid(&storage_view->cmn.buf.ref));
     sg_destroy_view(sv);
     check_shutdown();
@@ -442,22 +442,22 @@ static void test_binding_invalidation(void) {
             _sg_wgpu_bindgroup_t* bg = _sg_wgpu_lookup_bindgroup(id.id);
             bg->slot.state = SG_RESOURCESTATE_VALID; bg->bindgroup = (WGPUBindGroup)1;
             bg->key.items[0] = _sg_wgpu_bindgroups_cache_item((_sg_wgpu_bindgroups_cache_item_type_t)type, bindings[i], slot.id, slot.uninit_count);
-            _sg_wgpu_bindgroups_cache_set(1, id.id); _sg.wgpu.bindings_cache.bg = id;
+            _sg_wgpu_bindgroups_cache_promote(_sg_wgpu_bindgroups_cache_ways(1), 0, id.id); _sg.wgpu.bindings_cache.bg = id;
             for (int other = 1; other <= 3; ++other) {
                 if (other == type) continue;
                 _sg_wgpu_bindgroups_cache_invalidate((_sg_wgpu_bindgroups_cache_item_type_t)other, &slot);
-                assert(_sg_wgpu_bindgroups_cache_get(1) == id.id);
+                assert(_sg_wgpu_bindgroups_cache_ways(1)[0].id == id.id);
             }
             slot.uninit_count++;
             _sg_wgpu_bindgroups_cache_invalidate((_sg_wgpu_bindgroups_cache_item_type_t)type, &slot);
-            assert(_sg_wgpu_bindgroups_cache_get(1) == id.id);
+            assert(_sg_wgpu_bindgroups_cache_ways(1)[0].id == id.id);
             slot.uninit_count--;
             slot.id += 0x10000;
             _sg_wgpu_bindgroups_cache_invalidate((_sg_wgpu_bindgroups_cache_item_type_t)type, &slot);
-            assert(_sg_wgpu_bindgroups_cache_get(1) == id.id);
+            assert(_sg_wgpu_bindgroups_cache_ways(1)[0].id == id.id);
             slot.id -= 0x10000;
             _sg_wgpu_bindgroups_cache_invalidate((_sg_wgpu_bindgroups_cache_item_type_t)type, &slot);
-            assert(_sg_wgpu_bindgroups_cache_get(1) == SG_INVALID_ID);
+            assert(_sg_wgpu_bindgroups_cache_ways(1)[0].id == SG_INVALID_ID);
             assert(_sg.wgpu.bindings_cache.bg.id == SG_INVALID_ID);
         }
     }
@@ -610,6 +610,43 @@ static void test_shader_binding_reuse(bool is_compute) {
         assert(mock.group_creates == mock.group_releases);
     }
 }
+
+// 8 cache slots form one 8-way set, so every key shares it.
+static void test_bindgroup_lru(void) {
+    setup(8);
+    sg_shader shader = sg_make_shader(&(sg_shader_desc){.vertex_func.source = "mock", .fragment_func.source = "mock",
+        .samplers[2] = {.stage = SG_SHADERSTAGE_FRAGMENT, .wgsl_group1_binding_n = 11}});
+    sg_sampler smps[9];
+    for (int i = 0; i < 9; ++i) smps[i] = sg_make_sampler(&(sg_sampler_desc){0});
+    _sg_pipeline_t pip = {0}; pip.slot.id = 1; pip.cmn.shader = _sg_shader_ref(_sg_lookup_shader(shader.id));
+    _sg_bindings_ptrs_t bnd = {.pip = &pip};
+    _sg.wgpu.rpass_enc = (WGPURenderPassEncoder)1;
+    #define APPLY(i) (bnd.smps[2] = _sg_lookup_sampler(smps[i].id), assert(_sg_wgpu_apply_bindings_bindgroup(&bnd)))
+    sg_frame_stats_wgpu_bindings* s = &_sg.stats.cur_frame.wgpu.bindings;
+    memset(s, 0, sizeof *s); // shader creation counts its own groups
+    for (int i = 0; i < 8; ++i) APPLY(i);
+    APPLY(0); // hit: 0 becomes most recent, 1 least
+    assert(s->num_create_bindgroup == 8 && s->num_bindgroup_cache_misses == 8 && s->num_bindgroup_cache_hits == 1);
+    APPLY(8); APPLY(0); // the full set evicts 1, keeps 0
+    assert(s->num_create_bindgroup == 9 && s->num_discard_bindgroup == 1 && s->num_bindgroup_cache_collisions == 1);
+    APPLY(1); // evicts 2: order 1 0 8 7 6 5 4 3
+    assert(s->num_create_bindgroup == 10 && s->num_discard_bindgroup == 2 && s->num_bindgroup_cache_collisions == 2);
+    sg_destroy_sampler(smps[7]); // invalidation closes the gap mid-set
+    assert(s->num_discard_bindgroup == 3 && s->num_bindgroup_cache_invalidates == 1);
+    APPLY(2); // free way, no eviction
+    assert(s->num_create_bindgroup == 11 && s->num_discard_bindgroup == 3 && s->num_bindgroup_cache_misses == 9);
+    const int cached[] = {3, 4, 5, 6, 8, 0, 1, 2};
+    for (int i = 0; i < 8; ++i) APPLY(cached[i]);
+    assert(s->num_create_bindgroup == 11 && s->num_bindgroup_cache_hits == 10 && s->num_bindgroup_cache_collisions == 2);
+    #undef APPLY
+    _sg.wgpu.rpass_enc = 0;
+    sg_destroy_shader(shader);
+    assert(_sg_wgpu_bindgroups_cache_ways(0)[0].id == SG_INVALID_ID);
+    for (int i = 0; i < 9; ++i) if (i != 7) sg_destroy_sampler(smps[i]);
+    check_shutdown();
+    assert(mock.group_creates == mock.group_releases);
+}
+
 static void test_unsealed_images(void) {
     setup(8);
     const sg_image_desc desc = {.width = 8, .height = 4, .num_mipmaps = 4, .usage.write_unsealed = true};
@@ -749,7 +786,7 @@ static void test_pass_local_depth(void) {
 int main(void) {
     test_pass_local_depth();
     test_uniform_minimum_sizes();
-    test_binding_invalidation(); test_shader_binding_reuse(false); test_shader_binding_reuse(true);
+    test_binding_invalidation(); test_shader_binding_reuse(false); test_shader_binding_reuse(true); test_bindgroup_lru();
     test_copy_and_reuse(); test_borrowed_failed_and_readback(); test_capacity_budget_and_shutdown();
     test_full_queue(); test_views_and_images(); test_sparse_uniforms_and_index_format();
     test_unsealed_images(); test_unsealed_compressed_images();

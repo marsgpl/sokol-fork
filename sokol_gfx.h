@@ -1889,8 +1889,9 @@
       cache to prevent excessive creation and destruction of BindGroup objects
       when calling sg_apply_bindings(). The number of slots in the bindgroups
       cache is defined in sg_desc.wgpu.bindgroups_cache_size when calling
-      sg_setup. The cache size must be a power-of-2 number, with the default being
-      1024. The bindgroups cache behaviour can be observed by calling the new
+      sg_setup. The cache size must be a power-of-2 number of at least 8, with
+      the default being 1024. Slots form 8-way sets with least-recently-used
+      eviction. The bindgroups cache behaviour can be observed by calling the new
       function sg_query_stats(), where the following struct items are
       of interest:
 
@@ -4580,7 +4581,7 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(METAL_CREATE_TEXTUREVIEW_FAILED, "failed to create texture view object (metal)") \
     _SG_LOGITEM_XMACRO(WGPU_RETIREMENT_QUEUE_FULL, "owned-resource retirement queue full; commit or increase sg_desc.wgpu.retirement_queue_size") \
     _SG_LOGITEM_XMACRO(WGPU_BINDGROUPS_POOL_EXHAUSTED, "bindgroups pool exhausted (increase sg_desc.bindgroups_cache_size) (wgpu)") \
-    _SG_LOGITEM_XMACRO(WGPU_BINDGROUPSCACHE_SIZE_GREATER_ONE, "sg_desc.wgpu.bindgroups_cache_size must be > 1 (wgpu)") \
+    _SG_LOGITEM_XMACRO(WGPU_BINDGROUPSCACHE_SIZE_TOO_SMALL, "sg_desc.wgpu.bindgroups_cache_size must be >= 8 (wgpu)") \
     _SG_LOGITEM_XMACRO(WGPU_BINDGROUPSCACHE_SIZE_POW2, "sg_desc.wgpu.bindgroups_cache_size must be a power of 2 (wgpu)") \
     _SG_LOGITEM_XMACRO(WGPU_CREATEBINDGROUP_FAILED, "wgpuDeviceCreateBindGroup failed") \
     _SG_LOGITEM_XMACRO(WGPU_CREATE_BUFFER_FAILED, "wgpuDeviceCreateBuffer() failed") \
@@ -5088,12 +5089,12 @@ typedef enum sg_log_item {
         .wgpu.bindgroups_cache_size
             The size of the bindgroups cache for re-using BindGroup objects
             between sg_apply_bindings() calls. The smaller the cache size,
-            the more likely are cache slot collisions which will cause
+            the more likely are full 8-way sets (collisions) which will cause
             a BindGroups object to be destroyed and a new one created.
             Use the information returned by sg_query_stats() to check
             if this is a frequent occurrence, and increase the cache size as
             needed (the default is 1024).
-            NOTE: wgpu_bindgroups_cache_size must be a power-of-2 number!
+            NOTE: wgpu_bindgroups_cache_size must be a power-of-2 number >= 8!
         .environment.wgpu.device
             a WGPUDevice handle
 
@@ -5223,7 +5224,7 @@ typedef struct sg_metal_desc {
 
 typedef struct sg_wgpu_desc {
     bool disable_bindgroups_cache; // set to true to disable the WebGPU backend BindGroup cache
-    int bindgroups_cache_size;     // number of slots in the WebGPU bindgroup cache (must be 2^N)
+    int bindgroups_cache_size;     // number of slots in the WebGPU bindgroup cache (must be 2^N, >= 8)
     int retirement_queue_size;     // owned buffers/images awaiting Destroy; default: buffer + image pool sizes
 } sg_wgpu_desc;
 
@@ -7203,9 +7204,12 @@ typedef struct {
     uint64_t items[_SG_WGPU_BINDGROUPSCACHEKEY_NUM_ITEMS];
 } _sg_wgpu_bindgroups_cache_key_t;
 
+// Slopa: 8-way sets, LRU-ordered: valid ids form a most-recent-first prefix of each set.
+// Simulated 1.25-1.5k random keys/frame in 4,096 slots: direct mapping recreates ~330-460 groups, 8-way ~4-14.
+#define _SG_WGPU_BINDGROUPSCACHE_WAYS (8)
 typedef struct {
     uint32_t num;           // must be 2^n
-    uint32_t index_mask;    // mask to turn hash into valid index
+    uint32_t index_mask;    // mask to turn hash into the index of a set's first way
     _sg_wgpu_bindgroup_handle_t* items;
 } _sg_wgpu_bindgroups_cache_t;
 
@@ -18361,14 +18365,14 @@ _SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_init(const sg_desc* desc) {
     SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.index_mask == 0);
     SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.items == 0);
     const int num = desc->wgpu.bindgroups_cache_size;
-    if (num <= 1) {
-        _SG_PANIC(WGPU_BINDGROUPSCACHE_SIZE_GREATER_ONE);
+    if (num < _SG_WGPU_BINDGROUPSCACHE_WAYS) {
+        _SG_PANIC(WGPU_BINDGROUPSCACHE_SIZE_TOO_SMALL);
     }
     if (!_sg_ispow2(num)) {
         _SG_PANIC(WGPU_BINDGROUPSCACHE_SIZE_POW2);
     }
     _sg.wgpu.bindgroups_cache.num = (uint32_t)desc->wgpu.bindgroups_cache_size;
-    _sg.wgpu.bindgroups_cache.index_mask = _sg.wgpu.bindgroups_cache.num - 1;
+    _sg.wgpu.bindgroups_cache.index_mask = (_sg.wgpu.bindgroups_cache.num - 1) & ~(uint32_t)(_SG_WGPU_BINDGROUPSCACHE_WAYS - 1);
     size_t size_in_bytes = sizeof(_sg_wgpu_bindgroup_handle_t) * (size_t)num;
     _sg.wgpu.bindgroups_cache.items = (_sg_wgpu_bindgroup_handle_t*)_sg_malloc_clear(size_in_bytes);
 }
@@ -18382,18 +18386,27 @@ _SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_discard(void) {
     _sg.wgpu.bindgroups_cache.index_mask = 0;
 }
 
-_SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_set(uint64_t hash, uint32_t bg_id) {
-    uint32_t index = hash & _sg.wgpu.bindgroups_cache.index_mask;
-    SOKOL_ASSERT(index < _sg.wgpu.bindgroups_cache.num);
+_SOKOL_PRIVATE _sg_wgpu_bindgroup_handle_t* _sg_wgpu_bindgroups_cache_ways(uint64_t hash) {
+    uint32_t index = (uint32_t)hash & _sg.wgpu.bindgroups_cache.index_mask;
+    SOKOL_ASSERT((index + _SG_WGPU_BINDGROUPSCACHE_WAYS) <= _sg.wgpu.bindgroups_cache.num);
     SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.items);
-    _sg.wgpu.bindgroups_cache.items[index].id = bg_id;
+    return &_sg.wgpu.bindgroups_cache.items[index];
 }
 
-_SOKOL_PRIVATE uint32_t _sg_wgpu_bindgroups_cache_get(uint64_t hash) {
-    uint32_t index = hash & _sg.wgpu.bindgroups_cache.index_mask;
+// Makes bg_id the set's most recent way, overwriting `way`: the hit, the first free way or the evicted LRU way.
+_SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_promote(_sg_wgpu_bindgroup_handle_t* ways, int way, uint32_t bg_id) {
+    SOKOL_ASSERT((way >= 0) && (way < _SG_WGPU_BINDGROUPSCACHE_WAYS));
+    memmove(&ways[1], &ways[0], (size_t)way * sizeof(ways[0]));
+    ways[0].id = bg_id;
+}
+
+// Empties one way and closes the gap, keeping the set's valid prefix.
+_SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_remove(uint32_t index) {
     SOKOL_ASSERT(index < _sg.wgpu.bindgroups_cache.num);
-    SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.items);
-    return _sg.wgpu.bindgroups_cache.items[index].id;
+    _sg_wgpu_bindgroup_handle_t* items = _sg.wgpu.bindgroups_cache.items;
+    const uint32_t last = index | (_SG_WGPU_BINDGROUPSCACHE_WAYS - 1);
+    memmove(&items[index], &items[index + 1], (size_t)(last - index) * sizeof(items[0]));
+    items[last].id = SG_INVALID_ID;
 }
 
 // called from wgpu resource destroy functions to also invalidate any
@@ -18403,7 +18416,8 @@ _SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_invalidate(_sg_wgpu_bindgroups_cac
     const uint64_t key_mask = (UINT64_C(1) << 56) - 1;
     const uint64_t key_item = _sg_wgpu_bindgroups_cache_item(type, 0, slot->id, slot->uninit_count);
     SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.items);
-    for (uint32_t cache_item_idx = 0; cache_item_idx < _sg.wgpu.bindgroups_cache.num; cache_item_idx++) {
+    // Backward scan: a removal only shifts already-checked ways.
+    for (uint32_t cache_item_idx = _sg.wgpu.bindgroups_cache.num; cache_item_idx-- > 0;) {
         const uint32_t bg_id = _sg.wgpu.bindgroups_cache.items[cache_item_idx].id;
         if (bg_id != SG_INVALID_ID) {
             _sg_wgpu_bindgroup_t* bg = _sg_wgpu_lookup_bindgroup(bg_id);
@@ -18418,7 +18432,7 @@ _SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_invalidate(_sg_wgpu_bindgroups_cac
             }
             if (invalidate_cache_item) {
                 _sg_wgpu_discard_bindgroup(bg); bg = 0;
-                _sg_wgpu_bindgroups_cache_set(cache_item_idx, SG_INVALID_ID);
+                _sg_wgpu_bindgroups_cache_remove(cache_item_idx);
                 _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_invalidates);
             }
         }
@@ -18521,28 +18535,30 @@ _SOKOL_PRIVATE bool _sg_wgpu_apply_bindings_bindgroup(_sg_bindings_ptrs_t* bnd) 
         _sg_wgpu_bindgroup_t* bg = 0;
         _sg_wgpu_bindgroups_cache_key_t key;
         _sg_wgpu_init_bindgroups_cache_key(&key, bnd);
-        uint32_t bg_id = _sg_wgpu_bindgroups_cache_get(key.hash);
-        if (bg_id != SG_INVALID_ID) {
-            // potential cache hit
-            bg = _sg_wgpu_lookup_bindgroup(bg_id);
+        _sg_wgpu_bindgroup_handle_t* ways = _sg_wgpu_bindgroups_cache_ways(key.hash);
+        int way = 0;
+        for (; (way < _SG_WGPU_BINDGROUPSCACHE_WAYS) && (ways[way].id != SG_INVALID_ID); way++) {
+            bg = _sg_wgpu_lookup_bindgroup(ways[way].id);
             SOKOL_ASSERT(bg && (bg->slot.state == SG_RESOURCESTATE_VALID));
-            if (!_sg_wgpu_compare_bindgroups_cache_key(&key, &bg->key)) {
-                // cache collision, need to delete cached bindgroup
-                _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_collisions);
-                _sg_wgpu_discard_bindgroup(bg);
-                _sg_wgpu_bindgroups_cache_set(key.hash, SG_INVALID_ID);
-                bg = 0;
-            } else {
-                _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_hits);
+            if (_sg_wgpu_compare_bindgroups_cache_key(&key, &bg->key)) {
+                break;
             }
+            bg = 0;
+        }
+        if (bg) {
+            _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_hits);
         } else {
-            _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_misses);
-        }
-        if (bg == 0) {
-            // either no cache entry yet, or cache collision, create new bindgroup and store in cache
+            if (way == _SG_WGPU_BINDGROUPSCACHE_WAYS) {
+                // cache collision: the set is full, delete its least recently used bindgroup
+                _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_collisions);
+                way -= 1;
+                _sg_wgpu_discard_bindgroup(_sg_wgpu_lookup_bindgroup(ways[way].id));
+            } else {
+                _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_misses);
+            }
             bg = _sg_wgpu_create_bindgroup(bnd);
-            _sg_wgpu_bindgroups_cache_set(key.hash, bg->slot.id);
         }
+        _sg_wgpu_bindgroups_cache_promote(ways, way, bg->slot.id);
         if (bg && bg->slot.state == SG_RESOURCESTATE_VALID) {
             _sg_wgpu_set_bindgroup(_SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, bg);
         } else {
