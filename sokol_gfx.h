@@ -3088,6 +3088,10 @@ typedef struct sg_pass {
         uint32_t sample_index; // render: vertex start/end, fragment start/end; compute: start/end
         bool defer_present; // keep a split swapchain drawable until commit
     } metal;
+    // Slopa: nonzero = this pass's end query in the armed frame timestamp set, instead of query 1.
+    struct {
+        uint32_t end_query;
+    } wgpu;
     uint32_t _end_canary;
 } sg_pass;
 
@@ -5589,7 +5593,8 @@ SOKOL_GFX_API_DECL const void* sg_wgpu_queue(void);
 // WebGPU: return this frame's WGPUCommandEncoder
 SOKOL_GFX_API_DECL const void* sg_wgpu_command_encoder(void);
 // Slopa: borrow a two-slot timestamp query set until commit. Arm before the first pass.
-// Query 0 marks the first pass start; query 1 is overwritten at each pass end.
+// Query 0 marks the first pass start; query 1 is overwritten at each pass end
+// unless sg_pass.wgpu.end_query names that pass's own end query.
 SOKOL_GFX_API_DECL void sg_wgpu_arm_frame_timestamps(const void* query_set);
 SOKOL_GFX_API_DECL uint32_t sg_wgpu_frame_timestamp_passes(void);
 // Slopa: hash and sort uniform payloads at commit for wgpu.uniforms num_unique/size_unique/
@@ -19637,14 +19642,14 @@ _SOKOL_PRIVATE void _sg_wgpu_init_ds_att(WGPURenderPassDepthStencilAttachment* w
     wgpu_att->stencilReadOnly = false;
 }
 
-_SOKOL_PRIVATE WGPUPassTimestampWrites _sg_wgpu_pass_timestamps(void) {
+_SOKOL_PRIVATE WGPUPassTimestampWrites _sg_wgpu_pass_timestamps(const sg_pass* pass) {
     WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
     writes.querySet = _sg.wgpu.timestamp_query;
     if (writes.querySet) {
         if (_sg.wgpu.timestamp_passes++ == 0) {
             writes.beginningOfPassWriteIndex = 0;
         }
-        writes.endOfPassWriteIndex = 1;
+        writes.endOfPassWriteIndex = pass->wgpu.end_query ? pass->wgpu.end_query : 1;
     }
     return writes;
 }
@@ -19652,7 +19657,7 @@ _SOKOL_PRIVATE WGPUPassTimestampWrites _sg_wgpu_pass_timestamps(void) {
 _SOKOL_PRIVATE void _sg_wgpu_begin_compute_pass(const sg_pass* pass) {
     _SG_STRUCT(WGPUComputePassDescriptor, wgpu_pass_desc);
     wgpu_pass_desc.label = _sg_wgpu_stringview(pass->label);
-    WGPUPassTimestampWrites timestamps = _sg_wgpu_pass_timestamps();
+    WGPUPassTimestampWrites timestamps = _sg_wgpu_pass_timestamps(pass);
     wgpu_pass_desc.timestampWrites = timestamps.querySet ? &timestamps : 0;
     _sg.wgpu.cpass_enc = wgpuCommandEncoderBeginComputePass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
     _sg_stats_inc(wgpu.num_begin_compute_pass);
@@ -19703,7 +19708,7 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_render_pass(const sg_pass* pass, const _sg_at
             wgpu_pass_desc.depthStencilAttachment = &wgpu_ds_att;
         }
     }
-    WGPUPassTimestampWrites timestamps = _sg_wgpu_pass_timestamps();
+    WGPUPassTimestampWrites timestamps = _sg_wgpu_pass_timestamps(pass);
     wgpu_pass_desc.timestampWrites = timestamps.querySet ? &timestamps : 0;
     _sg.wgpu.rpass_enc = wgpuCommandEncoderBeginRenderPass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
     _sg_stats_inc(wgpu.num_begin_render_pass);
