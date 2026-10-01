@@ -5591,6 +5591,9 @@ SOKOL_GFX_API_DECL const void* sg_wgpu_command_encoder(void);
 // Query 0 marks the first pass start; query 1 is overwritten at each pass end.
 SOKOL_GFX_API_DECL void sg_wgpu_arm_frame_timestamps(const void* query_set);
 SOKOL_GFX_API_DECL uint32_t sg_wgpu_frame_timestamp_passes(void);
+// Slopa: hash and sort uniform payloads at commit for wgpu.uniforms num_unique/size_unique/
+// size_hash/size_compare. Off by default, needs stats enabled; set before the frame's first apply.
+SOKOL_GFX_API_DECL void sg_wgpu_profile_uniforms(bool enabled);
 // WebGPU: return WGPURenderPassEncoder of current pass (returns 0 when outside pass or in a compute pass)
 SOKOL_GFX_API_DECL const void* sg_wgpu_render_pass_encoder(void);
 // WebGPU: return WGPUComputePassEncoder of current pass (returns 0 when outside pass or in a render pass)
@@ -7170,6 +7173,7 @@ typedef struct {
     _sg_wgpu_uniform_record_t* records;
     uint32_t num_records;
     uint32_t max_records;
+    bool profiled;      // sg_wgpu_profile_uniforms: record payloads for the unique stats
     bool dirty;
     uint32_t bind_offsets[SG_MAX_UNIFORMBLOCK_BINDSLOTS];   // NOTE: index is sokol-gfx ub slot index!
 } _sg_wgpu_uniform_system_t;
@@ -18031,7 +18035,7 @@ _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_apply_pipeline(void) {
 _SOKOL_PRIVATE uint64_t _sg_wgpu_hash(const void* key, int len, uint64_t seed);
 
 _SOKOL_PRIVATE void _sg_wgpu_uniform_stats_record(int ub_slot, uint32_t size) {
-    if (!_sg.stats_enabled) {
+    if (!_sg.stats_enabled || !_sg.wgpu.uniform.profiled) {
         return;
     }
     _sg_wgpu_uniform_system_t* u = &_sg.wgpu.uniform;
@@ -28109,6 +28113,15 @@ SOKOL_API_IMPL uint32_t sg_wgpu_frame_timestamp_passes(void) {
         return _sg.wgpu.timestamp_passes;
     #else
         return 0;
+    #endif
+}
+
+SOKOL_API_IMPL void sg_wgpu_profile_uniforms(bool enabled) {
+    SOKOL_ASSERT(_sg.valid);
+    #if defined(SOKOL_WGPU)
+        _sg.wgpu.uniform.profiled = enabled;
+    #else
+        _SOKOL_UNUSED(enabled);
     #endif
 }
 
