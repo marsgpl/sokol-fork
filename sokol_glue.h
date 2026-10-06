@@ -143,6 +143,7 @@ SOKOL_GLUE_API_DECL sg_swapchain sglue_swapchain(void);
 _SOKOL_PRIVATE sg_pixel_format _sglue_to_sgpixelformat(sapp_pixel_format fmt) {
     switch (fmt) {
         case SAPP_PIXELFORMAT_NONE: return SG_PIXELFORMAT_NONE;
+        case SAPP_PIXELFORMAT_RGBA16F: return SG_PIXELFORMAT_RGBA16F;
         case SAPP_PIXELFORMAT_RGBA8: return SG_PIXELFORMAT_RGBA8;
         case SAPP_PIXELFORMAT_SRGB8A8: return SG_PIXELFORMAT_SRGB8A8;
         case SAPP_PIXELFORMAT_BGRA8: return SG_PIXELFORMAT_BGRA8;

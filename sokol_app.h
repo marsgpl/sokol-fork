@@ -1866,6 +1866,7 @@ typedef enum sapp_pixel_format {
     SAPP_PIXELFORMAT_SBGRA8,
     SAPP_PIXELFORMAT_DEPTH,
     SAPP_PIXELFORMAT_DEPTH_STENCIL,
+    SAPP_PIXELFORMAT_RGBA16F,
     _SAPP_PIXELFORMAT_FORCE_U32 = 0x7FFFFFFF
 } sapp_pixel_format;
 
@@ -2148,6 +2149,11 @@ SOKOL_APP_API_DECL float sapp_heightf(void);
 SOKOL_APP_API_DECL sapp_pixel_format sapp_color_format(void);
 /* get default framebuffer depth pixel format */
 SOKOL_APP_API_DECL sapp_pixel_format sapp_depth_format(void);
+/* Slopa: call on the app/render thread between frames, before acquiring a drawable.
+   Browser callers must first verify extended canvas and display support. */
+SOKOL_APP_API_DECL void sapp_set_hdr_enabled(bool enabled);
+SOKOL_APP_API_DECL float sapp_hdr_headroom(void);
+SOKOL_APP_API_DECL float sapp_hdr_potential_headroom(void);
 /* get default framebuffer sample count */
 SOKOL_APP_API_DECL int sapp_sample_count(void);
 /* returns true when high_dpi was requested and actually running in a high-dpi scenario */
@@ -2727,6 +2733,7 @@ typedef struct {
     WGPUDevice device;
     WGPUSurface surface;
     WGPUTextureFormat render_format;
+    WGPUTextureFormat sdr_format;
     WGPUTexture msaa_tex;
     WGPUTextureView msaa_view;
     WGPUTexture depth_stencil_tex;
@@ -3281,6 +3288,7 @@ typedef struct {
     int sample_count;
     int swap_interval;
     float dpi_scale;
+    bool hdr_enabled;
     float render_scale; // PATCH(slopa): sapp_set_render_scale, multiplies dpi_scale
     uint64_t frame_count;
     sapp_event event;
@@ -3925,6 +3933,8 @@ _SOKOL_PRIVATE void _sapp_wgpu_create_swapchain(bool called_from_resize) {
             _SAPP_PANIC(WGPU_SWAPCHAIN_SURFACE_GET_CAPABILITIES_FAILED);
         }
         _sapp.wgpu.render_format = _sapp_wgpu_pick_render_format(surf_caps.formatCount, surf_caps.formats);
+        _sapp.wgpu.sdr_format = _sapp.wgpu.render_format;
+        wgpuSurfaceCapabilitiesFreeMembers(surf_caps);
     }
 
     SOKOL_ASSERT(_sapp.wgpu.surface);
@@ -3940,6 +3950,12 @@ _SOKOL_PRIVATE void _sapp_wgpu_create_swapchain(bool called_from_resize) {
         if (_sapp.desc.html5.premultiplied_alpha) {
             surf_conf.alphaMode = WGPUCompositeAlphaMode_Premultiplied;
         }
+    #endif
+    #if defined(_SAPP_EMSCRIPTEN)
+        WGPUSurfaceColorManagement color = WGPU_SURFACE_COLOR_MANAGEMENT_INIT;
+        color.colorSpace = WGPUPredefinedColorSpace_SRGB;
+        color.toneMappingMode = _sapp.hdr_enabled ? WGPUToneMappingMode_Extended : WGPUToneMappingMode_Standard;
+        surf_conf.nextInChain = &color.chain;
     #endif
     surf_conf.presentMode = WGPUPresentMode_Fifo;
     wgpuSurfaceConfigure(_sapp.wgpu.surface, &surf_conf);
@@ -5150,7 +5166,7 @@ _SOKOL_PRIVATE void _sapp_macos_mtl_swapchain_create(int width, int height) {
         _SAPP_PANIC(METAL_CREATE_SWAPCHAIN_DEPTH_TEXTURE_FAILED);
     }
     if (_sapp.sample_count > 1) {
-        _sapp.macos.mtl.msaa_tex = _sapp_macos_mtl_create_texture(width, height, MTLPixelFormatBGRA8Unorm, _sapp.sample_count, "swapchain_msaa_tex");
+        _sapp.macos.mtl.msaa_tex = _sapp_macos_mtl_create_texture(width, height, _sapp.macos.mtl.layer.pixelFormat, _sapp.sample_count, "swapchain_msaa_tex");
         if (nil == _sapp.macos.mtl.msaa_tex) {
             _SAPP_PANIC(METAL_CREATE_SWAPCHAIN_MSAA_TEXTURE_FAILED);
         }
@@ -5173,7 +5189,6 @@ _SOKOL_PRIVATE void _sapp_macos_mtl_swapchain_resize(int width, int height) {
 
 _SOKOL_PRIVATE id<CAMetalDrawable> _sapp_macos_mtl_swapchain_next(void) {
     id<CAMetalDrawable> drawable = [_sapp.macos.mtl.layer nextDrawable];
-    SOKOL_ASSERT(drawable != nil);
     return drawable;
 }
 
@@ -14064,9 +14079,62 @@ SOKOL_API_IMPL float sapp_heightf(void) {
     return (float)sapp_height();
 }
 
+SOKOL_API_IMPL float sapp_hdr_headroom(void) {
+    #if defined(_SAPP_MACOS) && defined(SOKOL_METAL)
+        SOKOL_ASSERT([NSThread isMainThread]);
+        if (@available(macOS 10.15, *)) {
+            NSScreen* screen = _sapp.macos.window.screen;
+            return screen ? (float)screen.maximumExtendedDynamicRangeColorComponentValue : 1.0f;
+        }
+    #endif
+    return 1.0f;
+}
+
+SOKOL_API_IMPL float sapp_hdr_potential_headroom(void) {
+    #if defined(_SAPP_MACOS) && defined(SOKOL_METAL)
+        SOKOL_ASSERT([NSThread isMainThread]);
+        if (@available(macOS 10.15, *)) {
+            NSScreen* screen = _sapp.macos.window.screen;
+            return screen ? (float)screen.maximumPotentialExtendedDynamicRangeColorComponentValue : 1.0f;
+        }
+    #endif
+    return 1.0f;
+}
+
+SOKOL_API_IMPL void sapp_set_hdr_enabled(bool enabled) {
+    if (_sapp.hdr_enabled == enabled) return;
+    #if defined(_SAPP_MACOS) && defined(SOKOL_METAL)
+        SOKOL_ASSERT([NSThread isMainThread]);
+        if (@available(macOS 10.15, *)) {
+            if (enabled && sapp_hdr_potential_headroom() <= 1.0f) return;
+            CAMetalLayer* layer = _sapp.macos.mtl.layer;
+            CGColorSpaceRef color = enabled ? CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB) : NULL;
+            SOKOL_ASSERT(!enabled || color);
+            layer.wantsExtendedDynamicRangeContent = enabled;
+            layer.pixelFormat = enabled ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm;
+            layer.colorspace = color;
+            if (color) CGColorSpaceRelease(color);
+            _sapp.hdr_enabled = enabled;
+            if (_sapp.sample_count > 1) {
+                _sapp_macos_mtl_swapchain_resize(sapp_width(), sapp_height());
+            }
+        }
+    #elif defined(_SAPP_EMSCRIPTEN) && defined(SOKOL_WGPU)
+        SOKOL_ASSERT(_sapp.wgpu.init_done && !_sapp.wgpu.swapchain_view);
+        _sapp.hdr_enabled = enabled;
+        _sapp.wgpu.render_format = enabled ? WGPUTextureFormat_RGBA16Float : _sapp.wgpu.sdr_format;
+        _sapp_wgpu_discard_swapchain(true);
+        _sapp_wgpu_create_swapchain(true);
+    #else
+        _SOKOL_UNUSED(enabled);
+    #endif
+}
+
 SOKOL_API_IMPL sapp_pixel_format sapp_color_format(void) {
     #if defined(SOKOL_WGPU)
         switch (_sapp.wgpu.render_format) {
+            case WGPUTextureFormat_RGBA16Float:
+                return SAPP_PIXELFORMAT_RGBA16F;
             case WGPUTextureFormat_RGBA8Unorm:
                 return SAPP_PIXELFORMAT_RGBA8;
             case WGPUTextureFormat_BGRA8Unorm:
@@ -14087,7 +14155,7 @@ SOKOL_API_IMPL sapp_pixel_format sapp_color_format(void) {
                 return SAPP_PIXELFORMAT_NONE;
         }
     #elif defined(SOKOL_METAL) || defined(SOKOL_D3D11)
-        return SAPP_PIXELFORMAT_BGRA8;
+        return _sapp.hdr_enabled ? SAPP_PIXELFORMAT_RGBA16F : SAPP_PIXELFORMAT_BGRA8;
     #else
         return SAPP_PIXELFORMAT_RGBA8;
     #endif
@@ -14473,6 +14541,7 @@ SOKOL_API_IMPL sapp_swapchain sapp_get_swapchain(void) {
     #if defined(SOKOL_METAL)
         #if defined(_SAPP_MACOS)
             res.metal.current_drawable = (__bridge const void*) _sapp_macos_mtl_swapchain_next();
+            res.invalid = !res.metal.current_drawable;
             res.metal.depth_stencil_texture = (__bridge const void*) _sapp.macos.mtl.depth_tex;
             res.metal.msaa_color_texture = (__bridge const void*) _sapp.macos.mtl.msaa_tex;
         #else
