@@ -3934,6 +3934,7 @@ _SOKOL_PRIVATE void _sapp_wgpu_create_swapchain(bool called_from_resize) {
         }
         _sapp.wgpu.render_format = _sapp_wgpu_pick_render_format(surf_caps.formatCount, surf_caps.formats);
         _sapp.wgpu.sdr_format = _sapp.wgpu.render_format;
+        if (_sapp.hdr_enabled) _sapp.wgpu.render_format = WGPUTextureFormat_RGBA16Float;
         wgpuSurfaceCapabilitiesFreeMembers(surf_caps);
     }
 
@@ -14564,8 +14565,8 @@ SOKOL_API_IMPL sapp_swapchain sapp_get_swapchain(void) {
     #if defined(SOKOL_WGPU)
         SOKOL_ASSERT(0 == _sapp.wgpu.swapchain_view);
         _sapp_wgpu_swapchain_next();
-        // FIXME: swapchain_view being null must be allowed and should skip the frame
-        SOKOL_ASSERT(_sapp.wgpu.swapchain_view);
+        res.invalid = !_sapp.wgpu.swapchain_view;
+        if (res.invalid) return res;
         if (_sapp.sample_count > 1) {
             SOKOL_ASSERT(_sapp.wgpu.msaa_view);
             res.wgpu.render_view = (const void*) _sapp.wgpu.msaa_view;
