@@ -16116,11 +16116,24 @@ _SOKOL_PRIVATE void _sg_mtl_discard_sampler(_sg_sampler_t* smp) {
     _sg_mtl_release_resource(_sg.frame_index, smp->mtl.sampler_state);
 }
 
+// [[invariant]] is ignored without preserveInvariance: a depth prepass and its
+// colour pass link one vertex function under two fragment functions
+_SOKOL_PRIVATE MTLCompileOptions* _sg_mtl_compile_options(void) {
+    static MTLCompileOptions* options = nil;
+    if (nil == options) {
+        options = [[MTLCompileOptions alloc] init];
+        if (@available(macOS 11.0, iOS 14.0, *)) {
+            options.preserveInvariance = YES;
+        }
+    }
+    return options;
+}
+
 _SOKOL_PRIVATE id<MTLLibrary> _sg_mtl_compile_library(const char* src) {
     NSError* err = NULL;
     id<MTLLibrary> lib = [_sg.mtl.device
         newLibraryWithSource:[NSString stringWithUTF8String:src]
-        options:nil
+        options:_sg_mtl_compile_options()
         error:&err
     ];
     if (err) {
@@ -16266,7 +16279,7 @@ _SOKOL_PRIVATE sg_resource_state _sg_mtl_async_shader(_sg_shader_t* shd, const s
         }
         #endif
         dispatch_group_enter(group);
-        [_sg.mtl.device newLibraryWithSource:[NSString stringWithUTF8String:funcs[i]->source] options:nil
+        [_sg.mtl.device newLibraryWithSource:[NSString stringWithUTF8String:funcs[i]->source] options:_sg_mtl_compile_options()
             completionHandler:^(id<MTLLibrary> lib, NSError* err) {
                 if (label) {
                     lib.label = label;
