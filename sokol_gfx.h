@@ -18842,13 +18842,11 @@ _SOKOL_PRIVATE void _sg_wgpu_async_drain(void) {
             if (pip->wgpu.rpip || pip->wgpu.cpip) {
                 pip->slot.state = SG_RESOURCESTATE_VALID;
             } else if (pip->cmn.is_compute) {
-                _SG_ERROR(WGPU_CREATE_COMPUTE_PIPELINE_FAILED);
-                _SG_LOGMSG(WGPU_CREATE_COMPUTE_PIPELINE_FAILED, job->msg);
                 pip->slot.state = SG_RESOURCESTATE_FAILED;
+                _sg_log(SG_LOGITEM_WGPU_CREATE_COMPUTE_PIPELINE_FAILED, 1, job->msg, __LINE__);
             } else {
-                _SG_ERROR(WGPU_CREATE_RENDER_PIPELINE_FAILED);
-                _SG_LOGMSG(WGPU_CREATE_RENDER_PIPELINE_FAILED, job->msg);
                 pip->slot.state = SG_RESOURCESTATE_FAILED;
+                _sg_log(SG_LOGITEM_WGPU_CREATE_RENDER_PIPELINE_FAILED, 1, job->msg, __LINE__);
             }
         }
         _sg_wgpu_async_free(job);
