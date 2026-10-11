@@ -3227,6 +3227,11 @@ typedef struct sg_bindings {
         the validation-only async readback path in src/sg.c and sg_apple.mm.
         adds WebGPU CopySrc; no-op on other backends. see game/README.md
         "patch sokol: buffer CopySrc"
+    .copyable (default: false)
+        patch(sulrim): this buffer may be the source or destination of a
+        GPU buffer-to-buffer copy even when immutable (a compute-written
+        buffer grown by copying into a bigger one). adds WebGPU
+        CopySrc|CopyDst and Vulkan TRANSFER_SRC; no-op on other backends
 */
 typedef struct sg_buffer_usage {
     bool vertex_buffer;
@@ -3238,6 +3243,7 @@ typedef struct sg_buffer_usage {
     bool stream_update;
     bool gpu_write_only; // patch(sulrim)
     bool readback_source; // patch(sulrim)
+    bool copyable; // patch(sulrim)
 } sg_buffer_usage;
 
 /*
@@ -17466,6 +17472,10 @@ _SOKOL_PRIVATE WGPUBufferUsage _sg_wgpu_buffer_usage(const sg_buffer_usage* usg)
     if (usg->readback_source) {
         res |= (int)WGPUBufferUsage_CopySrc;
     }
+    // patch(sulrim): opt-in copy source/destination, see sg_buffer_usage
+    if (usg->copyable) {
+        res |= (int)(WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst);
+    }
     return (WGPUBufferUsage)res;
 }
 
@@ -21358,6 +21368,10 @@ _SOKOL_PRIVATE VkBufferUsageFlags _sg_vk_buffer_usage(const sg_buffer_usage* usg
     }
     if (usg->storage_buffer) {
         res |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
+    // patch(sulrim): opt-in copy source, see sg_buffer_usage.copyable
+    if (usg->copyable) {
+        res |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     }
     return res;
 }
