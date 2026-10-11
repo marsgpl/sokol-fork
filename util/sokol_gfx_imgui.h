@@ -1303,6 +1303,7 @@ _SOKOL_PRIVATE const char* _sgimgui_pixelformat_string(sg_pixel_format fmt) {
         case SG_PIXELFORMAT_RGBA32F: return "RGBA32F";
         case SG_PIXELFORMAT_DEPTH: return "DEPTH";
         case SG_PIXELFORMAT_DEPTH_STENCIL: return "DEPTH_STENCIL";
+        case SG_PIXELFORMAT_DEPTH16: return "DEPTH16";
         case SG_PIXELFORMAT_BC1_RGBA: return "BC1_RGBA";
         case SG_PIXELFORMAT_BC2_RGBA: return "BC2_RGBA";
         case SG_PIXELFORMAT_BC3_RGBA: return "BC3_RGBA";
@@ -4664,6 +4665,7 @@ _SOKOL_PRIVATE void _sgimgui_draw_frame_stats_panel(_sgimgui_t* ctx) {
                 _sgimgui_frame_stats(prev_frame.metal.uniforms.num_set_vertex_buffer_offset);
                 _sgimgui_frame_stats(prev_frame.metal.uniforms.num_set_fragment_buffer_offset);
                 _sgimgui_frame_stats(prev_frame.metal.uniforms.num_set_compute_buffer_offset);
+                _sgimgui_frame_stats(prev_frame.metal.uniforms.size_used);
                 break;
             case SG_BACKEND_D3D11:
                 _sgimgui_frame_stats(prev_frame.d3d11.pass.num_om_set_render_targets);

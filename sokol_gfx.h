@@ -2200,6 +2200,9 @@ typedef enum sg_pixel_format {
     SG_PIXELFORMAT_ASTC_4x4_RGBA,
     SG_PIXELFORMAT_ASTC_4x4_SRGBA,
 
+    // Sulrim extension, appended so existing values keep their numbers
+    SG_PIXELFORMAT_DEPTH16,     // 16-bit unorm depth (shadow maps), no stencil
+
     _SG_PIXELFORMAT_NUM,
     _SG_PIXELFORMAT_FORCE_U32 = 0x7FFFFFFF
 } sg_pixel_format;
@@ -4334,6 +4337,9 @@ typedef struct sg_frame_stats_metal_uniforms {
     uint32_t num_set_vertex_buffer_offset;
     uint32_t num_set_fragment_buffer_offset;
     uint32_t num_set_compute_buffer_offset;
+    // Sulrim: uniform buffer bytes this frame consumed, aligned: the offset reached
+    // at commit, to size sg_desc.uniform_buffer_size (wgpu twin: uniforms.size_write_buffer)
+    uint32_t size_used;
 } sg_frame_stats_metal_uniforms;
 
 typedef struct sg_frame_stats_metal {
@@ -8913,7 +8919,8 @@ _SOKOL_PRIVATE bool _sg_is_valid_storage_image_format(sg_pixel_format fmt) {
 }
 
 _SOKOL_PRIVATE bool _sg_is_depth_or_depth_stencil_format(sg_pixel_format fmt) {
-    return (SG_PIXELFORMAT_DEPTH == fmt) || (SG_PIXELFORMAT_DEPTH_STENCIL == fmt);
+    return (SG_PIXELFORMAT_DEPTH == fmt) || (SG_PIXELFORMAT_DEPTH_STENCIL == fmt)
+        || (SG_PIXELFORMAT_DEPTH16 == fmt);
 }
 
 _SOKOL_PRIVATE bool _sg_is_depth_stencil_format(sg_pixel_format fmt) {
@@ -8971,6 +8978,8 @@ _SOKOL_PRIVATE int _sg_pixelformat_bytesize(sg_pixel_format fmt) {
         case SG_PIXELFORMAT_DEPTH:
         case SG_PIXELFORMAT_DEPTH_STENCIL:
             return 4;
+        case SG_PIXELFORMAT_DEPTH16:
+            return 2;
         default:
             SOKOL_UNREACHABLE;
             return 0;
@@ -9183,6 +9192,7 @@ _SOKOL_PRIVATE void _sg_dummy_setup_backend(const sg_desc* desc) {
     }
     _sg.formats[SG_PIXELFORMAT_DEPTH].depth = true;
     _sg.formats[SG_PIXELFORMAT_DEPTH_STENCIL].depth = true;
+    _sg.formats[SG_PIXELFORMAT_DEPTH16] = _sg.formats[SG_PIXELFORMAT_DEPTH];
     _sg.limits.max_image_size_2d = 1024;
     _sg.limits.max_image_size_cube = 1024;
     _sg.limits.max_image_size_3d = 1024;
@@ -9894,6 +9904,8 @@ _SOKOL_PRIVATE GLenum _sg_gl_teximage_type(sg_pixel_format fmt) {
             return GL_FLOAT;
         case SG_PIXELFORMAT_DEPTH_STENCIL:
             return GL_UNSIGNED_INT_24_8;
+        case SG_PIXELFORMAT_DEPTH16:
+            return GL_UNSIGNED_SHORT;
         default:
             SOKOL_UNREACHABLE; return 0;
     }
@@ -9952,6 +9964,8 @@ _SOKOL_PRIVATE GLenum _sg_gl_teximage_format(sg_pixel_format fmt) {
             return GL_DEPTH_COMPONENT;
         case SG_PIXELFORMAT_DEPTH_STENCIL:
             return GL_DEPTH_STENCIL;
+        case SG_PIXELFORMAT_DEPTH16:
+            return GL_DEPTH_COMPONENT;
         case SG_PIXELFORMAT_BC1_RGBA:
             return GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
         case SG_PIXELFORMAT_BC2_RGBA:
@@ -10053,6 +10067,7 @@ _SOKOL_PRIVATE GLenum _sg_gl_teximage_internal_format(sg_pixel_format fmt) {
         case SG_PIXELFORMAT_RGBA32F:    return GL_RGBA32F;
         case SG_PIXELFORMAT_DEPTH:      return GL_DEPTH_COMPONENT32F;
         case SG_PIXELFORMAT_DEPTH_STENCIL:      return GL_DEPTH24_STENCIL8;
+        case SG_PIXELFORMAT_DEPTH16:            return GL_DEPTH_COMPONENT16;
         case SG_PIXELFORMAT_BC1_RGBA:           return GL_COMPRESSED_RGBA_S3TC_DXT1_EXT;
         case SG_PIXELFORMAT_BC2_RGBA:           return GL_COMPRESSED_RGBA_S3TC_DXT3_EXT;
         case SG_PIXELFORMAT_BC3_RGBA:           return GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
@@ -10138,6 +10153,7 @@ _SOKOL_PRIVATE void _sg_gl_init_pixelformats(bool has_bgra) {
     _sg_pixelformat_srm(&_sg.formats[SG_PIXELFORMAT_RGBA32SI]);
     _sg_pixelformat_srmd(&_sg.formats[SG_PIXELFORMAT_DEPTH]);
     _sg_pixelformat_srmd(&_sg.formats[SG_PIXELFORMAT_DEPTH_STENCIL]);
+    _sg_pixelformat_srmd(&_sg.formats[SG_PIXELFORMAT_DEPTH16]);
 }
 
 // FIXME: OES_half_float_blend
@@ -13188,6 +13204,7 @@ _SOKOL_PRIVATE DXGI_FORMAT _sg_d3d11_texture_pixel_format(sg_pixel_format fmt) {
         case SG_PIXELFORMAT_RGBA32F:        return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case SG_PIXELFORMAT_DEPTH:          return DXGI_FORMAT_R32_TYPELESS;
         case SG_PIXELFORMAT_DEPTH_STENCIL:  return DXGI_FORMAT_R24G8_TYPELESS;
+        case SG_PIXELFORMAT_DEPTH16:        return DXGI_FORMAT_R16_TYPELESS;
         case SG_PIXELFORMAT_BC1_RGBA:       return DXGI_FORMAT_BC1_UNORM;
         case SG_PIXELFORMAT_BC2_RGBA:       return DXGI_FORMAT_BC2_UNORM;
         case SG_PIXELFORMAT_BC3_RGBA:       return DXGI_FORMAT_BC3_UNORM;
@@ -13209,6 +13226,8 @@ _SOKOL_PRIVATE DXGI_FORMAT _sg_d3d11_srv_pixel_format(sg_pixel_format fmt) {
         return DXGI_FORMAT_R32_FLOAT;
     } else if (fmt == SG_PIXELFORMAT_DEPTH_STENCIL) {
         return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    } else if (fmt == SG_PIXELFORMAT_DEPTH16) {
+        return DXGI_FORMAT_R16_UNORM;
     } else {
         return _sg_d3d11_texture_pixel_format(fmt);
     }
@@ -13219,6 +13238,8 @@ _SOKOL_PRIVATE DXGI_FORMAT _sg_d3d11_dsv_pixel_format(sg_pixel_format fmt) {
         return DXGI_FORMAT_D32_FLOAT;
     } else if (fmt == SG_PIXELFORMAT_DEPTH_STENCIL) {
         return DXGI_FORMAT_D24_UNORM_S8_UINT;
+    } else if (fmt == SG_PIXELFORMAT_DEPTH16) {
+        return DXGI_FORMAT_D16_UNORM;
     } else {
         return _sg_d3d11_texture_pixel_format(fmt);
     }
@@ -13229,6 +13250,8 @@ _SOKOL_PRIVATE DXGI_FORMAT _sg_d3d11_rtv_uav_pixel_format(sg_pixel_format fmt) {
         return DXGI_FORMAT_R32_FLOAT;
     } else if (fmt == SG_PIXELFORMAT_DEPTH_STENCIL) {
         return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    } else if (fmt == SG_PIXELFORMAT_DEPTH16) {
+        return DXGI_FORMAT_R16_UNORM;
     } else {
         return _sg_d3d11_texture_pixel_format(fmt);
     }
@@ -15067,6 +15090,7 @@ _SOKOL_PRIVATE MTLPixelFormat _sg_mtl_pixel_format(sg_pixel_format fmt) {
         case SG_PIXELFORMAT_RGBA32F:                return MTLPixelFormatRGBA32Float;
         case SG_PIXELFORMAT_DEPTH:                  return MTLPixelFormatDepth32Float;
         case SG_PIXELFORMAT_DEPTH_STENCIL:          return MTLPixelFormatDepth32Float_Stencil8;
+        case SG_PIXELFORMAT_DEPTH16:                return MTLPixelFormatDepth16Unorm;
         #if defined(_SG_TARGET_MACOS)
         case SG_PIXELFORMAT_BC1_RGBA:               return MTLPixelFormatBC1_RGBA;
         case SG_PIXELFORMAT_BC2_RGBA:               return MTLPixelFormatBC2_RGBA;
@@ -15548,6 +15572,7 @@ _SOKOL_PRIVATE void _sg_mtl_init_caps(void) {
     #endif
     _sg_pixelformat_srmd(&_sg.formats[SG_PIXELFORMAT_DEPTH]);
     _sg_pixelformat_srmd(&_sg.formats[SG_PIXELFORMAT_DEPTH_STENCIL]);
+    _sg_pixelformat_srmd(&_sg.formats[SG_PIXELFORMAT_DEPTH16]);
     #if defined(_SG_TARGET_MACOS)
         _sg_pixelformat_sf(&_sg.formats[SG_PIXELFORMAT_BC1_RGBA]);
         _sg_pixelformat_sf(&_sg.formats[SG_PIXELFORMAT_BC2_RGBA]);
@@ -16915,6 +16940,7 @@ _SOKOL_PRIVATE void _sg_mtl_commit(void) {
     if (++_sg.mtl.cur_frame_rotate_index >= SG_NUM_INFLIGHT_FRAMES) {
         _sg.mtl.cur_frame_rotate_index = 0;
     }
+    _sg_stats_add(metal.uniforms.size_used, (uint32_t)_sg.mtl.cur_ub_offset);
     _sg.mtl.cur_ub_offset = 0;
     _sg.mtl.cur_ub_base_ptr = 0;
     // NOTE: MTLCommandBuffer is autoreleased
@@ -17687,6 +17713,7 @@ _SOKOL_PRIVATE WGPUTextureFormat _sg_wgpu_textureformat(sg_pixel_format p) {
         case SG_PIXELFORMAT_RGBA32F:        return WGPUTextureFormat_RGBA32Float;
         case SG_PIXELFORMAT_DEPTH:          return WGPUTextureFormat_Depth32Float;
         case SG_PIXELFORMAT_DEPTH_STENCIL:  return WGPUTextureFormat_Depth32FloatStencil8;
+        case SG_PIXELFORMAT_DEPTH16:        return WGPUTextureFormat_Depth16Unorm;
         case SG_PIXELFORMAT_BC1_RGBA:       return WGPUTextureFormat_BC1RGBAUnorm;
         case SG_PIXELFORMAT_BC2_RGBA:       return WGPUTextureFormat_BC2RGBAUnorm;
         case SG_PIXELFORMAT_BC3_RGBA:       return WGPUTextureFormat_BC3RGBAUnorm;
@@ -17909,6 +17936,7 @@ _SOKOL_PRIVATE void _sg_wgpu_init_caps(void) {
 
     _sg_pixelformat_srmd(&_sg.formats[SG_PIXELFORMAT_DEPTH]);
     _sg_pixelformat_srmd(&_sg.formats[SG_PIXELFORMAT_DEPTH_STENCIL]);
+    _sg_pixelformat_srmd(&_sg.formats[SG_PIXELFORMAT_DEPTH16]);
 
     _sg_pixelformat_sf(&_sg.formats[SG_PIXELFORMAT_RGB9E5]);
 
@@ -21452,6 +21480,7 @@ _SOKOL_PRIVATE VkFormat _sg_vk_format(sg_pixel_format fmt) {
         case SG_PIXELFORMAT_RGBA32F:        return VK_FORMAT_R32G32B32A32_SFLOAT;
         case SG_PIXELFORMAT_DEPTH:          return VK_FORMAT_D32_SFLOAT;
         case SG_PIXELFORMAT_DEPTH_STENCIL:  return VK_FORMAT_D32_SFLOAT_S8_UINT;
+        case SG_PIXELFORMAT_DEPTH16:        return VK_FORMAT_D16_UNORM;
         case SG_PIXELFORMAT_BC1_RGBA:       return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
         case SG_PIXELFORMAT_BC2_RGBA:       return VK_FORMAT_BC2_UNORM_BLOCK;
         case SG_PIXELFORMAT_BC3_RGBA:       return VK_FORMAT_BC3_UNORM_BLOCK;

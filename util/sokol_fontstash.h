@@ -127,6 +127,10 @@
         - this will call sg_update_image() on the font atlas texture
           if fontstash.h has added any rasterized glyphs since the last
           frame
+        - with sfons_desc_t.write_rows set (Sulrim extension), it instead
+          calls write_rows() once with the union of dirty atlas rows; the
+          atlas is created gpu_write_only (a single backing) and starts
+          fully dirty after every (re)creation
 
     sfons_destroy(FONScontext* ctx):
         - destroy the font atlas texture, sgl_pipeline and sg_shader objects
@@ -231,6 +235,11 @@ typedef struct sfons_desc_t {
     int width;    // initial width of font atlas texture (default: 512, must be power of 2)
     int height;   // initial height of font atlas texture (default: 512, must be power of 2)
     sfons_allocator_t allocator;    // optional memory allocation overrides
+    // Sulrim extension (optional): when set, the atlas is one gpu_write_only
+    // backing and sfons_flush passes only the dirty rows (tightly packed, full
+    // width, 1 byte per pixel) to this function instead of sg_update_image()
+    void (*write_rows)(sg_image img, int y, int width, int height, const void* ptr, size_t size, void* user_data);
+    void* write_rows_user_data;
 } sfons_desc_t;
 
 SOKOL_FONTSTASH_API_DECL FONScontext* sfons_create(const sfons_desc_t* desc);
@@ -1721,6 +1730,7 @@ typedef struct _sfons_t {
     sg_sampler smp;
     int cur_width, cur_height;
     bool img_dirty;
+    int dirty_y0, dirty_y1;     // write_rows only: dirty row span [y0, y1)
 } _sfons_t;
 
 static void _sfons_clear(void* ptr, size_t size) {
@@ -1888,6 +1898,7 @@ static int _sfons_render_create(void* user_ptr, int width, int height) {
     img_desc.width = sfons->cur_width;
     img_desc.height = sfons->cur_height;
     img_desc.usage.dynamic_update = true;
+    img_desc.usage.gpu_write_only = (sfons->desc.write_rows != 0);
     img_desc.pixel_format = SG_PIXELFORMAT_R8;
     img_desc.label = "fontstash-image";
     sfons->img = sg_make_image(&img_desc);
@@ -1896,6 +1907,12 @@ static int _sfons_render_create(void* user_ptr, int width, int height) {
     view_desc.texture.image = sfons->img;
     view_desc.label = "fontstash-texview";
     sfons->tex_view = sg_make_view(&view_desc);
+    if (sfons->desc.write_rows) {
+        // a fresh texture is undefined: the first write_rows covers all of it
+        sfons->img_dirty = true;
+        sfons->dirty_y0 = 0;
+        sfons->dirty_y1 = height;
+    }
     return 1;
 }
 
@@ -1905,9 +1922,15 @@ static int _sfons_render_resize(void* user_ptr, int width, int height) {
 
 static void _sfons_render_update(void* user_ptr, int* rect, const unsigned char* data) {
     SOKOL_ASSERT(user_ptr && rect && data);
-    _SOKOL_UNUSED(rect);
     _SOKOL_UNUSED(data);
     _sfons_t* sfons = (_sfons_t*) user_ptr;
+    if (!sfons->img_dirty) {
+        sfons->dirty_y0 = rect[1];
+        sfons->dirty_y1 = rect[3];
+    } else {
+        sfons->dirty_y0 = (rect[1] < sfons->dirty_y0) ? rect[1] : sfons->dirty_y0;
+        sfons->dirty_y1 = (rect[3] > sfons->dirty_y1) ? rect[3] : sfons->dirty_y1;
+    }
     sfons->img_dirty = true;
 }
 
@@ -1992,7 +2015,17 @@ SOKOL_API_IMPL void sfons_destroy(FONScontext* ctx) {
 SOKOL_API_IMPL void sfons_flush(FONScontext* ctx) {
     SOKOL_ASSERT(ctx && ctx->params.userPtr);
     _sfons_t* sfons = (_sfons_t*) ctx->params.userPtr;
-    if (sfons->img_dirty) {
+    if (sfons->img_dirty && sfons->desc.write_rows) {
+        sfons->img_dirty = false;
+        const int y0 = (sfons->dirty_y0 < 0) ? 0 : sfons->dirty_y0;
+        const int y1 = (sfons->dirty_y1 > sfons->cur_height) ? sfons->cur_height : sfons->dirty_y1;
+        if (y1 > y0) {
+            const size_t pitch = (size_t) sfons->cur_width;
+            sfons->desc.write_rows(sfons->img, y0, sfons->cur_width, y1 - y0,
+                ctx->texData + pitch * (size_t)y0, pitch * (size_t)(y1 - y0),
+                sfons->desc.write_rows_user_data);
+        }
+    } else if (sfons->img_dirty) {
         sfons->img_dirty = false;
         sg_image_data data;
         _sfons_clear(&data, sizeof(data));
