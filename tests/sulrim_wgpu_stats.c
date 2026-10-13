@@ -96,6 +96,8 @@ void wgpuBufferDestroy(WGPUBuffer buffer) { (void)buffer; assert(false); }
 void wgpuBufferRelease(WGPUBuffer buffer) { (void)buffer; assert(false); }
 void wgpuTextureDestroy(WGPUTexture texture) { (void)texture; assert(false); }
 void wgpuTextureRelease(WGPUTexture texture) { (void)texture; assert(false); }
+void wgpuRenderPipelineRelease(WGPURenderPipeline pipeline) { (void)pipeline; assert(false); }
+void wgpuComputePipelineRelease(WGPUComputePipeline pipeline) { (void)pipeline; assert(false); }
 
 static void reset(void) {
     static uint8_t staging[4096];
@@ -105,6 +107,7 @@ static void reset(void) {
     _sg.valid = true;
     _sg.uniform_cache_frame = 1;
     _sg.stats_enabled = true;
+    _sg.wgpu.uniform.profiled = true;
     _sg.wgpu.dev = (WGPUDevice)1;
     _sg.wgpu.queue = (WGPUQueue)1;
     _sg.wgpu.uniform.buf = (WGPUBuffer)1;
@@ -444,7 +447,7 @@ static void test_uniform_reuse(void) {
         assert(_sg.wgpu.uniform.offset == 256);
         sg_draw(0, 3, 1);
         assert(calls.uniform_offset == 0);
-        // Same-shader raster variant, another shader, then the original.
+        // Same-shader raster variant and another shader of equal size rebind the first copy.
         for (int p = 2; p <= 3; ++p) {
             sg_apply_pipeline((sg_pipeline){(uint32_t)p});
             assert(_sg.applied_bindings_and_uniforms == 0);
@@ -452,39 +455,39 @@ static void test_uniform_reuse(void) {
             assert(_sg.applied_bindings_and_uniforms == (1 << 3));
             sg_draw(0, 3, 1);
         }
-        assert(_sg.wgpu.uniform.offset == 512 && calls.uniform_offset == 256);
+        assert(_sg.wgpu.uniform.offset == 256 && calls.uniform_offset == 0);
         sg_reset_state_cache();
         sg_apply_pipeline((sg_pipeline){1});
         sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
         sg_draw(0, 3, 1);
-        assert(_sg.wgpu.uniform.offset == 512 && calls.uniform_offset == 0);
+        assert(_sg.wgpu.uniform.offset == 256 && calls.uniform_offset == 0);
         assert(calls.draws == 4 && calls.uniform_binds == 4);
         // Temporary caller memory can change without changing earlier commands.
         data[7] = 9;
         data_id = sg_alloc_uniform_data_id();
         sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
-        assert(_sg.wgpu.uniform.offset == 768);
+        assert(_sg.wgpu.uniform.offset == 512);
         assert(((uint32_t*)_sg.wgpu.uniform.staging)[7] == 8);
-        assert(((uint32_t*)(_sg.wgpu.uniform.staging + 512))[7] == 9);
+        assert(((uint32_t*)(_sg.wgpu.uniform.staging + 256))[7] == 9);
         sg_apply_uniforms(3, &SG_RANGE(data));
-        assert(_sg.wgpu.uniform.offset == 1024);
+        assert(_sg.wgpu.uniform.offset == 768);
         sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
-        assert(_sg.wgpu.uniform.offset == 1024 && _sg.wgpu.uniform.bind_offsets[3] == 512);
-        // A different sparse slot never aliases the cached slot.
+        assert(_sg.wgpu.uniform.offset == 768 && _sg.wgpu.uniform.bind_offsets[3] == 256);
+        // Another sparse slot of the same declared size rebinds the range too.
         shaders[0].cmn.uniform_blocks[5].stage = SG_SHADERSTAGE_FRAGMENT;
         shaders[0].cmn.uniform_blocks[5].size = sizeof data;
         sg_apply_uniforms_cached(5, &SG_RANGE(data), data_id);
-        assert(_sg.wgpu.uniform.offset == 1280);
+        assert(_sg.wgpu.uniform.offset == 768 && _sg.wgpu.uniform.bind_offsets[5] == 256);
         shaders[0].cmn.uniform_blocks[5].stage = SG_SHADERSTAGE_NONE;
         // Invalid size/slot/pass must retain ordinary validation and never cache.
         sg_apply_uniforms_cached(3, &(sg_range){data, 16}, data_id);
-        assert(!_sg.next_draw_valid && _sg.wgpu.uniform.offset == 1280);
+        assert(!_sg.next_draw_valid && _sg.wgpu.uniform.offset == 768);
         sg_apply_pipeline((sg_pipeline){1});
         sg_apply_uniforms_cached(2, &SG_RANGE(data), data_id);
-        assert(!_sg.next_draw_valid && _sg.wgpu.uniform.offset == 1280);
+        assert(!_sg.next_draw_valid && _sg.wgpu.uniform.offset == 768);
         _sg.cur_pass.valid = false;
         sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
-        assert(_sg.wgpu.uniform.offset == 1280);
+        assert(_sg.wgpu.uniform.offset == 768);
         _sg.cur_pass.valid = true;
         sg_apply_pipeline((sg_pipeline){1});
         // A new pass in the same commit still rebinds its shader's group.
@@ -498,43 +501,118 @@ static void test_uniform_reuse(void) {
         sg_apply_pipeline((sg_pipeline){1});
         sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
         sg_draw(0, 3, 1);
-        assert(calls.uniform_offset == 512 && _sg.wgpu.uniform.offset == 1280);
+        assert(calls.uniform_offset == 256 && _sg.wgpu.uniform.offset == 768);
         sg_end_pass();
         sg_commit();
         assert(_sg.uniform_cache_frame == 2 && _sg.wgpu.uniform.offset == 0);
         const sg_frame_stats stats = sg_query_stats().prev_frame;
         if (profiling) {
             assert(stats.num_apply_uniforms_cached == 11 && stats.num_apply_uniforms == 12);
-            assert(stats.num_reuse_uniforms == 4 && stats.size_reuse_uniforms == 128);
-            assert(stats.wgpu.uniforms.size_copy == 160);
-            assert(stats.wgpu.uniforms.size_unique == 128);
-            assert(stats.wgpu.uniforms.size_write_buffer == 1280);
+            assert(stats.num_reuse_uniforms == 6 && stats.size_reuse_uniforms == 192);
+            assert(stats.wgpu.uniforms.size_copy == 96);
+            assert(stats.wgpu.uniforms.size_unique == 64);
+            assert(stats.wgpu.uniforms.size_write_buffer == 768);
         } else {
             assert(stats.num_reuse_uniforms == 0 && !_sg.wgpu.uniform.records);
         }
+        // Commit invalidates every range: the first apply copies again.
         _sg.cur_pass.in_pass = _sg.cur_pass.valid = true;
         _sg_wgpu_begin_pass(&render, &attachments);
         sg_apply_pipeline((sg_pipeline){1});
         sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
         assert(_sg.wgpu.uniform.offset == 256);
-        // Same public shader ID after uninit/reinit has no reusable range.
+        // Ranges belong to the commit, not a shader: uninit/reinit still reuses.
         _sg_reset_shader_to_alloc_state(&shaders[0]);
         shaders[0].slot.state = SG_RESOURCESTATE_VALID;
         shaders[0].cmn.uniform_blocks[3].stage = SG_SHADERSTAGE_FRAGMENT;
         shaders[0].cmn.uniform_blocks[3].size = sizeof data;
-        assert(shaders[0].cmn.uniform_blocks[3].cache_frame == 0);
-        assert(!_sg_validate_apply_uniforms(3, &SG_RANGE(data)));
+        assert(!_sg_validate_apply_uniforms(3, &SG_RANGE(data), data_id));
         pipelines[1].cmn.shader = _sg_shader_ref(&shaders[0]);
         shaders[0].wgpu.bg_view_smp_empty = (WGPUBindGroup)2;
         sg_apply_pipeline((sg_pipeline){1});
         sg_apply_uniforms_cached(3, &SG_RANGE(data), data_id);
-        assert(_sg.wgpu.uniform.offset == 512);
+        assert(_sg.wgpu.uniform.offset == 256 && _sg.wgpu.uniform.bind_offsets[3] == 0);
     }
+}
+
+// R94: one commit-scoped table keyed by data ID, shared by every shader and slot.
+static void test_uniform_table(void) {
+    reset();
+    _sg_shader_t shaders[2] = {0};
+    _sg_pipeline_t pipelines[3] = {0};
+    const uint32_t sizes[2] = {32, 16};
+    for (int i = 0; i < 2; ++i) {
+        shaders[i].slot.id = (uint32_t)i + 1;
+        shaders[i].slot.state = SG_RESOURCESTATE_VALID;
+        shaders[i].cmn.uniform_blocks[0].stage = SG_SHADERSTAGE_VERTEX;
+        shaders[i].cmn.uniform_blocks[0].size = sizes[i];
+        shaders[i].cmn.uniform_blocks[1].stage = SG_SHADERSTAGE_FRAGMENT;
+        shaders[i].cmn.uniform_blocks[1].size = 32;
+        shaders[i].wgpu.bg_ub = (WGPUBindGroup)1;
+        shaders[i].wgpu.bg_view_smp_empty = (WGPUBindGroup)2;
+        shaders[i].wgpu.ub_dynoffsets[1] = 1;
+        shaders[i].wgpu.ub_num_dynoffsets = 2;
+        pipelines[i + 1].slot.id = (uint32_t)i + 1;
+        pipelines[i + 1].slot.state = SG_RESOURCESTATE_VALID;
+        pipelines[i + 1].cmn.color_count = 1;
+        pipelines[i + 1].cmn.index_type = SG_INDEXTYPE_NONE;
+        pipelines[i + 1].cmn.shader = _sg_shader_ref(&shaders[i]);
+        pipelines[i + 1].wgpu.rpip = (WGPURenderPipeline)1;
+    }
+    _sg.pools.pipeline_pool.size = 3;
+    _sg.pools.pipelines = pipelines;
+    _sg.cur_pass.in_pass = _sg.cur_pass.valid = true;
+    _sg.wgpu.rpass_enc = (WGPURenderPassEncoder)1;
+    uint32_t a[8] = {1}, b[8] = {2}, half[4] = {3};
+    const uint64_t a_id = sg_alloc_uniform_data_id();
+    sg_apply_pipeline((sg_pipeline){1});
+    // A-B-A on one slot: the return to A rebinds its range (a one-entry cache copied it).
+    sg_apply_uniforms_cached(1, &SG_RANGE(a), a_id);
+    const uint64_t b_id = sg_alloc_uniform_data_id();
+    sg_apply_uniforms_cached(1, &SG_RANGE(b), b_id);
+    sg_apply_uniforms_cached(1, &SG_RANGE(a), a_id);
+    assert(_sg.wgpu.uniform.offset == 512 && _sg.wgpu.uniform.bind_offsets[1] == 0);
+    // Cross-stage: a vertex slot of equal size reads the fragment payload's range.
+    sg_apply_uniforms_cached(0, &SG_RANGE(b), b_id);
+    assert(_sg.wgpu.uniform.offset == 512 && _sg.wgpu.uniform.bind_offsets[0] == 256);
+    // Debug validation: one ID names one size per commit (the ID contract).
+    const uint64_t d_id = sg_alloc_uniform_data_id();
+    sg_apply_uniforms_cached(1, &SG_RANGE(a), d_id);
+    sg_apply_pipeline((sg_pipeline){2});
+    sg_apply_uniforms_cached(0, &SG_RANGE(half), d_id);
+    assert(_sg.validate_error == SG_LOGITEM_VALIDATE_AU_CACHED_SIZE);
+    assert(!_sg.next_draw_valid && _sg.wgpu.uniform.offset == 768);
+    // Without validation the size guard still refuses the range and copies.
+    _sg.desc.disable_validation = true;
+    sg_apply_pipeline((sg_pipeline){2});
+    sg_apply_uniforms_cached(0, &SG_RANGE(half), d_id);
+    assert(_sg.wgpu.uniform.offset == 1024 && _sg.wgpu.uniform.bind_offsets[0] == 768);
+    _sg.desc.disable_validation = false;
+    // A pending pipeline drops the apply before the table.
+    sg_apply_pipeline((sg_pipeline){1});
+    _sg.cur_pip_pending = true;
+    const uint64_t c_id = sg_alloc_uniform_data_id();
+    sg_apply_uniforms_cached(1, &SG_RANGE(b), c_id);
+    assert(_sg.wgpu.uniform.offset == 1024 && _sg_uniform_cache_entry(c_id)->data_id != c_id);
+    _sg.cur_pip_pending = false;
+    // Direct-mapped collision: the newer ID evicts, the older one copies again.
+    const uint64_t mask = _SG_UNIFORM_CACHE_SIZE - 1;
+    while ((sg_alloc_uniform_data_id() & mask) != (b_id & mask)) {}
+    sg_apply_uniforms_cached(1, &SG_RANGE(a), _sg_uniform_data_id);
+    assert(_sg.wgpu.uniform.offset == 1280);
+    sg_apply_uniforms_cached(1, &SG_RANGE(b), b_id);
+    assert(_sg.wgpu.uniform.offset == 1536 && _sg.wgpu.uniform.bind_offsets[1] == 1280);
+    sg_apply_uniforms_cached(1, &SG_RANGE(a), a_id);
+    assert(_sg.wgpu.uniform.offset == 1536 && _sg.wgpu.uniform.bind_offsets[1] == 0);
+    assert(_sg.stats.cur_frame.num_reuse_uniforms == 3);
+    assert(_sg.stats.cur_frame.size_reuse_uniforms == 96);
+    assert(_sg.stats.cur_frame.wgpu.uniforms.size_copy == 32 * 5 + 16);
 }
 
 #if !defined(SULRIM_WGPU_STATS_NO_MAIN)
 int main(void) {
     test_uniform_reuse();
+    test_uniform_table();
     test_direct_instance_offsets();
     test_render_state_cache();
     test_padding();
@@ -542,6 +620,6 @@ int main(void) {
     test_real_pass_timestamps();
     test_external_frame_lifetime();
     test_unique_payloads_and_capacities();
-    puts("Sokol WebGPU instrumentation: 8 tests passed");
+    puts("Sokol WebGPU instrumentation: 9 tests passed");
 }
 #endif

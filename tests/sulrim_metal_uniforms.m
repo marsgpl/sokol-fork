@@ -1,4 +1,4 @@
-// Headless real Metal: immutable content IDs, shader switches and ring rotation.
+// Headless real Metal: immutable content IDs shared across shaders, slots, stages and ring rotation.
 #define SOKOL_IMPL
 #define SOKOL_METAL
 #include "sokol_gfx.h"
@@ -56,15 +56,28 @@ int main(void) {
             .fragment_func = {.source = source, .entry = "fs"},
             .uniform_blocks[3] = {.stage = SG_SHADERSTAGE_FRAGMENT, .size = 2400, .msl_buffer_n = 2},
         };
-        sg_shader shaders[2] = {sg_make_shader(&desc), sg_make_shader(&desc)};
-        sg_pipeline pipelines[3];
-        for (int i = 0; i < 3; ++i) {
-            assert(sg_query_shader_state(shaders[i == 2]) == SG_RESOURCESTATE_VALID);
-            pipelines[i] = sg_make_pipeline(&(sg_pipeline_desc){.shader = shaders[i == 2],
+        // Third shader: the same 2400-byte block on a vertex slot, passed to the fragment flat.
+        const char* vertex_source =
+            "#include <metal_stdlib>\nusing namespace metal;\n"
+            "struct U { float4 values[150]; };\n"
+            "struct V { float4 pos [[position]]; float4 color [[flat]]; };\n"
+            "vertex V vs(uint v [[vertex_id]], constant U& u [[buffer(0)]]) { float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)}; V o; o.pos=float4(p[v],0,1); o.color=u.values[149]; return o; }\n"
+            "fragment float4 fs(V i [[stage_in]]) {return i.color;}\n";
+        sg_shader_desc vertex_desc = {
+            .vertex_func = {.source = vertex_source, .entry = "vs"},
+            .fragment_func = {.source = vertex_source, .entry = "fs"},
+            .uniform_blocks[0] = {.stage = SG_SHADERSTAGE_VERTEX, .size = 2400, .msl_buffer_n = 0},
+        };
+        sg_shader shaders[3] = {sg_make_shader(&desc), sg_make_shader(&desc), sg_make_shader(&vertex_desc)};
+        const int pipeline_shader[4] = {0, 0, 1, 2};
+        sg_pipeline pipelines[4];
+        for (int i = 0; i < 4; ++i) {
+            assert(sg_query_shader_state(shaders[pipeline_shader[i]]) == SG_RESOURCESTATE_VALID);
+            pipelines[i] = sg_make_pipeline(&(sg_pipeline_desc){.shader = shaders[pipeline_shader[i]],
                 .depth.pixel_format = SG_PIXELFORMAT_NONE, .colors[0].pixel_format = SG_PIXELFORMAT_RGBA8});
             assert(sg_query_pipeline_state(pipelines[i]) == SG_RESOURCESTATE_VALID);
         }
-        sg_image image = sg_make_image(&(sg_image_desc){.width = 4, .height = 1, .pixel_format = SG_PIXELFORMAT_RGBA8, .usage.color_attachment = true});
+        sg_image image = sg_make_image(&(sg_image_desc){.width = 6, .height = 1, .pixel_format = SG_PIXELFORMAT_RGBA8, .usage.color_attachment = true});
         sg_view color = sg_make_view(&(sg_view_desc){.color_attachment.image = image});
         assert(sg_query_image_state(image) == SG_RESOURCESTATE_VALID && sg_query_view_state(color) == SG_RESOURCESTATE_VALID);
         if (getenv("SULRIM_UNIFORM_BENCH")) benchmark(color, pipelines[0]);
@@ -79,17 +92,20 @@ int main(void) {
                 if (pass) target.action.colors[0].load_action = SG_LOADACTION_LOAD;
                 if (pass) sg_reset_state_cache();
                 sg_begin_pass(&target);
-                for (int x = pass * 2; x < pass * 2 + 2; ++x) {
-                    // Same-shader pipeline switch, then a new shader, then an ID change.
-                    sg_apply_pipeline(pipelines[x == 2 ? 2 : x == 1 ? 1 : 0]);
+                for (int x = pass * 3; x < pass * 3 + 3; ++x) {
+                    // Raster variant, another shader, an ID change, the return to red,
+                    // then red on another shader's vertex slot 0: one copy per ID.
+                    const int pipeline_index[6] = {0, 1, 2, 0, 0, 3};
+                    sg_apply_pipeline(pipelines[pipeline_index[x]]);
                     sg_apply_scissor_rect(x, 0, 1, 1, true);
-                    if (x == 3) sg_apply_uniforms_cached(3, &SG_RANGE(green), green_id);
-                    else sg_apply_uniforms_cached(3, &SG_RANGE(red), red_id);
+                    const int slot = x == 5 ? 0 : 3;
+                    if (x == 3) sg_apply_uniforms_cached(slot, &SG_RANGE(green), green_id);
+                    else sg_apply_uniforms_cached(slot, &SG_RANGE(red), red_id);
                     sg_draw(0, 3, 1);
                 }
                 sg_end_pass();
             }
-            assert(_sg.mtl.cur_ub_offset == 3 * _sg_roundup(2400, _SG_MTL_UB_ALIGN));
+            assert(_sg.mtl.cur_ub_offset == 2 * _sg_roundup(2400, _SG_MTL_UB_ALIGN));
             id<MTLCommandBuffer> command = [(__bridge id<MTLCommandBuffer>)sg_mtl_command_buffer() retain];
             id<MTLTexture> texture = (__bridge id<MTLTexture>)sg_mtl_query_image_info(image).tex[0];
             id<MTLBuffer> readback = [device newBufferWithLength:256 options:MTLResourceStorageModeShared];
@@ -97,19 +113,19 @@ int main(void) {
             id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
             assert(blit);
             [blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
-                sourceSize:MTLSizeMake(4,1,1) toBuffer:readback destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:256];
+                sourceSize:MTLSizeMake(6,1,1) toBuffer:readback destinationOffset:0 destinationBytesPerRow:256 destinationBytesPerImage:256];
             [blit endEncoding];
             sg_commit();
             [command waitUntilCompleted]; // Test-only readback.
             assert(command.status == MTLCommandBufferStatusCompleted);
             const uint8_t* pixels = readback.contents;
-            for (int x = 0; x < 4; ++x) {
+            for (int x = 0; x < 6; ++x) {
                 assert(pixels[x*4] == (x == 3 ? 0 : 255));
                 assert(pixels[x*4+1] == (x == 3 ? 255 : 0));
                 assert(pixels[x*4+2] == 0 && pixels[x*4+3] == 255);
             }
-            assert(sg_query_stats().prev_frame.num_reuse_uniforms == 1);
-            assert(sg_query_stats().prev_frame.size_reuse_uniforms == 2400);
+            assert(sg_query_stats().prev_frame.num_reuse_uniforms == 4);
+            assert(sg_query_stats().prev_frame.size_reuse_uniforms == 4 * 2400);
             [readback release]; [command release];
         }
         sg_shutdown();
@@ -118,5 +134,5 @@ int main(void) {
         sg_shutdown();
         [device release];
     }
-    puts("Metal uniform IDs: exact pixels across pipelines, passes, IDs, frame rotation and setup");
+    puts("Metal uniform IDs: exact pixels across pipelines, shaders, stages, passes, IDs, frame rotation and setup");
 }

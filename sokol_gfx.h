@@ -4985,6 +4985,7 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(VALIDATE_AU_PIPELINE_SHADER_VALID, "sg_apply_uniforms: shader associated with currently applied pipeline is not in valid state") \
     _SG_LOGITEM_XMACRO(VALIDATE_AU_NO_UNIFORMBLOCK_AT_SLOT, "sg_apply_uniforms: no uniform block declaration at this shader stage UB slot") \
     _SG_LOGITEM_XMACRO(VALIDATE_AU_SIZE, "sg_apply_uniforms: data size doesn't match declared uniform block size") \
+    _SG_LOGITEM_XMACRO(VALIDATE_AU_CACHED_SIZE, "sg_apply_uniforms_cached: data_id was applied with another size in this commit (one ID per payload)") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_RENDERPASS_EXPECTED, "sg_draw: must be called in a render pass") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_BASEELEMENT_GE_ZERO, "sg_draw: base_element cannot be < 0") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_NUMELEMENTS_GE_ZERO, "sg_draw: num_elements cannot be < 0") \
@@ -5321,10 +5322,11 @@ SOKOL_GFX_API_DECL void sg_apply_uniforms(int ub_slot, const sg_range* data);
    Allocate a fresh ID whenever any payload byte changes; never reuse an ID for
    different bytes or sizes. IDs may outlive a frame or sg_shutdown/sg_setup. */
 SOKOL_GFX_API_DECL uint64_t sg_alloc_uniform_data_id(void);
-/* Metal/WebGPU reuse the last cached upload for this shader/slot when ID and
-   commit match, otherwise copy data normally. Other backends always copy.
-   All ordinary validation, required-uniform flags and trace hooks still run.
-   No source pointer is retained. Caller owns the immutable-ID contract. */
+/* Metal/WebGPU: an ID already copied in this commit rebinds that ring range on
+   any shader/slot whose declared size equals data->size; otherwise copy data
+   normally. Other backends always copy. All ordinary validation,
+   required-uniform flags and trace hooks still run. No source pointer is
+   retained. Caller owns the immutable-ID contract. */
 SOKOL_GFX_API_DECL void sg_apply_uniforms_cached(int ub_slot, const sg_range* data, uint64_t data_id);
 SOKOL_GFX_API_DECL void sg_draw(int base_element, int num_elements, int num_instances);
 SOKOL_GFX_API_DECL void sg_draw_ex(int base_element, int num_elements, int num_instances, int base_vertex, int base_instance);
@@ -6488,11 +6490,6 @@ typedef struct {
 typedef struct {
     sg_shader_stage stage;
     uint32_t size;
-    #if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
-    uint64_t cache_frame;
-    uint64_t cache_data_id;
-    uint32_t cache_offset;
-    #endif
 } _sg_shader_uniform_block_t;
 
 typedef struct {
@@ -7584,11 +7581,26 @@ typedef struct {
     bool write;
 } _sg_pixelformat_info_t;
 
+#if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+// Sulrim: one commit's uniform ring ranges by data ID, direct-mapped (IDs are
+// sequential); a collision costs one copy. Stale commits never match.
+#define _SG_UNIFORM_CACHE_SIZE (256)
+typedef struct {
+    uint64_t frame;
+    uint64_t data_id;
+    uint32_t offset;
+    uint32_t size;
+} _sg_uniform_cache_entry_t;
+#endif
+
 typedef struct {
     bool valid;
     sg_desc desc;       // original desc with default values patched in
     uint32_t frame_index;
     uint64_t uniform_cache_frame;
+    #if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+    _sg_uniform_cache_entry_t uniform_cache[_SG_UNIFORM_CACHE_SIZE];
+    #endif
     struct {
         bool valid;
         bool in_pass;
@@ -25066,10 +25078,17 @@ _SOKOL_PRIVATE bool _sg_validate_apply_bindings(const sg_bindings* bindings) {
     #endif
 }
 
-_SOKOL_PRIVATE bool _sg_validate_apply_uniforms(int ub_slot, const sg_range* data) {
+#if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+_SOKOL_PRIVATE _sg_uniform_cache_entry_t* _sg_uniform_cache_entry(uint64_t data_id) {
+    return &_sg.uniform_cache[data_id & (_SG_UNIFORM_CACHE_SIZE - 1)];
+}
+#endif
+
+_SOKOL_PRIVATE bool _sg_validate_apply_uniforms(int ub_slot, const sg_range* data, uint64_t data_id) {
     #if !defined(SOKOL_DEBUG)
         _SOKOL_UNUSED(ub_slot);
         _SOKOL_UNUSED(data);
+        _SOKOL_UNUSED(data_id);
         return true;
     #else
         if (_sg.desc.disable_validation) {
@@ -25096,6 +25115,15 @@ _SOKOL_PRIVATE bool _sg_validate_apply_uniforms(int ub_slot, const sg_range* dat
                 _SG_VALIDATE(data->size == shd->cmn.uniform_blocks[ub_slot].size, VALIDATE_AU_SIZE);
             }
         }
+        #if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+        if (data_id) {
+            const _sg_uniform_cache_entry_t* e = _sg_uniform_cache_entry(data_id);
+            const bool is_recorded = e->frame == _sg.uniform_cache_frame && e->data_id == data_id;
+            _SG_VALIDATE(!is_recorded || e->size == data->size, VALIDATE_AU_CACHED_SIZE);
+        }
+        #else
+        _SOKOL_UNUSED(data_id);
+        #endif
         return _sg_validate_end();
     #endif
 }
@@ -27031,7 +27059,7 @@ _SOKOL_PRIVATE void _sg_apply_uniforms_checked(int ub_slot, const sg_range* data
         return;
     }
     _sg.applied_bindings_and_uniforms |= 1 << ub_slot;
-    if (!_sg_validate_apply_uniforms(ub_slot, data)) {
+    if (!_sg_validate_apply_uniforms(ub_slot, data, data_id)) {
         _sg.next_draw_valid = false;
         return;
     }
@@ -27041,19 +27069,20 @@ _SOKOL_PRIVATE void _sg_apply_uniforms_checked(int ub_slot, const sg_range* data
     #if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
     if (data_id) {
         const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
-        _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
-        _sg_shader_uniform_block_t* ub = &shd->cmn.uniform_blocks[ub_slot];
+        const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+        _sg_uniform_cache_entry_t* e = _sg_uniform_cache_entry(data_id);
         #if defined(SOKOL_METAL)
         const uint32_t offset = (uint32_t)_sg.mtl.cur_ub_offset;
         #else
         const uint32_t offset = _sg.wgpu.uniform.offset;
         #endif
-        if (ub->cache_frame == _sg.uniform_cache_frame && ub->cache_data_id == data_id
-            && ub->size == data->size && (uint64_t)ub->cache_offset + data->size <= offset) {
+        // The ring is append-only within a commit, so the range still holds this ID's bytes.
+        if (e->frame == _sg.uniform_cache_frame && e->data_id == data_id && e->size == data->size
+            && shd->cmn.uniform_blocks[ub_slot].size == data->size && (uint64_t)e->offset + data->size <= offset) {
             #if defined(SOKOL_METAL)
-            _sg_mtl_bind_uniforms(ub_slot, ub->cache_offset);
+            _sg_mtl_bind_uniforms(ub_slot, e->offset);
             #else
-            _sg.wgpu.uniform.bind_offsets[ub_slot] = ub->cache_offset;
+            _sg.wgpu.uniform.bind_offsets[ub_slot] = e->offset;
             _sg.wgpu.uniform.dirty = true;
             #endif
             _sg_stats_inc(num_reuse_uniforms);
@@ -27061,9 +27090,10 @@ _SOKOL_PRIVATE void _sg_apply_uniforms_checked(int ub_slot, const sg_range* data
             return;
         }
         _sg_apply_uniforms(ub_slot, data);
-        ub->cache_frame = _sg.uniform_cache_frame;
-        ub->cache_data_id = data_id;
-        ub->cache_offset = offset;
+        e->frame = _sg.uniform_cache_frame;
+        e->data_id = data_id;
+        e->offset = offset;
+        e->size = (uint32_t)data->size;
         return;
     }
     #endif
