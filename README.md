@@ -2,7 +2,7 @@
 
 > [!WARNING]
 > **This repository is a modified fork, not the official Sokol repository.**
-> It contains custom APIs and backend changes for [Sulrim](https://sulrim.io).
+> It contains custom APIs and backend changes for [Sulrim](https://sulrim.com).
 >
 > **Original project and upstream source: [floooh/sokol](https://github.com/floooh/sokol).**
 >
