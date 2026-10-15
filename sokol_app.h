@@ -3925,6 +3925,7 @@ _SOKOL_PRIVATE void _sapp_wgpu_create_swapchain(bool called_from_resize) {
             _SAPP_PANIC(WGPU_SWAPCHAIN_SURFACE_GET_CAPABILITIES_FAILED);
         }
         _sapp.wgpu.render_format = _sapp_wgpu_pick_render_format(surf_caps.formatCount, surf_caps.formats);
+        wgpuSurfaceCapabilitiesFreeMembers(surf_caps);
     }
 
     SOKOL_ASSERT(_sapp.wgpu.surface);
@@ -4034,7 +4035,6 @@ _SOKOL_PRIVATE void _sapp_wgpu_swapchain_next(void) {
             }
             _sapp_wgpu_discard_swapchain(false);
             _sapp_wgpu_create_swapchain(false);
-            // FIXME: currently this will assert in the caller
             return;
         case WGPUSurfaceGetCurrentTextureStatus_Error:
         default:
@@ -5173,7 +5173,6 @@ _SOKOL_PRIVATE void _sapp_macos_mtl_swapchain_resize(int width, int height) {
 
 _SOKOL_PRIVATE id<CAMetalDrawable> _sapp_macos_mtl_swapchain_next(void) {
     id<CAMetalDrawable> drawable = [_sapp.macos.mtl.layer nextDrawable];
-    SOKOL_ASSERT(drawable != nil);
     return drawable;
 }
 
@@ -14473,6 +14472,10 @@ SOKOL_API_IMPL sapp_swapchain sapp_get_swapchain(void) {
     #if defined(SOKOL_METAL)
         #if defined(_SAPP_MACOS)
             res.metal.current_drawable = (__bridge const void*) _sapp_macos_mtl_swapchain_next();
+            res.invalid = !res.metal.current_drawable;
+            if (res.invalid) {
+                return res;
+            }
             res.metal.depth_stencil_texture = (__bridge const void*) _sapp.macos.mtl.depth_tex;
             res.metal.msaa_color_texture = (__bridge const void*) _sapp.macos.mtl.msaa_tex;
         #else
@@ -14495,8 +14498,10 @@ SOKOL_API_IMPL sapp_swapchain sapp_get_swapchain(void) {
     #if defined(SOKOL_WGPU)
         SOKOL_ASSERT(0 == _sapp.wgpu.swapchain_view);
         _sapp_wgpu_swapchain_next();
-        // FIXME: swapchain_view being null must be allowed and should skip the frame
-        SOKOL_ASSERT(_sapp.wgpu.swapchain_view);
+        res.invalid = !_sapp.wgpu.swapchain_view;
+        if (res.invalid) {
+            return res;
+        }
         if (_sapp.sample_count > 1) {
             SOKOL_ASSERT(_sapp.wgpu.msaa_view);
             res.wgpu.render_view = (const void*) _sapp.wgpu.msaa_view;
