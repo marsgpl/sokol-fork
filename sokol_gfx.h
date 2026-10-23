@@ -15709,9 +15709,12 @@ _SOKOL_PRIVATE void _sg_mtl_pipeline_desc_funcs(id desc, bool is_compute, const 
         ((MTLComputePipelineDescriptor*)desc).computeFunction = _sg_mtl_id(shd->mtl.compute_func.mtl_func);
     } else {
         SOKOL_ASSERT(shd->mtl.vertex_func.mtl_func != _SG_MTL_INVALID_SLOT_INDEX);
-        SOKOL_ASSERT(shd->mtl.fragment_func.mtl_func != _SG_MTL_INVALID_SLOT_INDEX);
         ((MTLRenderPipelineDescriptor*)desc).vertexFunction = _sg_mtl_id(shd->mtl.vertex_func.mtl_func);
-        ((MTLRenderPipelineDescriptor*)desc).fragmentFunction = _sg_mtl_id(shd->mtl.fragment_func.mtl_func);
+        // patch(sulrim): a render shader without fragment_func is a depth-only
+        // caster: fragmentFunction stays nil and the GPU skips the fragment stage
+        if (shd->mtl.fragment_func.mtl_func != _SG_MTL_INVALID_SLOT_INDEX) {
+            ((MTLRenderPipelineDescriptor*)desc).fragmentFunction = _sg_mtl_id(shd->mtl.fragment_func.mtl_func);
+        }
     }
 }
 
@@ -19595,13 +19598,12 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_pipeline(_sg_pipeline_t* pip, c
         wgpu_pip_desc.multisample.count = (uint32_t)desc->sample_count;
         wgpu_pip_desc.multisample.mask = 0xFFFFFFFF;
         wgpu_pip_desc.multisample.alphaToCoverageEnabled = desc->alpha_to_coverage_enabled;
-        // patch(sulrim): attach the fragment stage even with ZERO color targets,
-        // which is what every other backend does (_sg_mtl_create_pipeline sets
-        // fragmentFunction unconditionally). a depth-only pipeline may carry a
-        // real fs that DISCARDS - shadow_fade.fs dithers the object caster
-        // fade - and dropping the stage silently made every shadow dissolve a
-        // snap on webgpu while metal faded. targetCount 0 is legal: the depth
-        // attachment is the pipeline's own and both depth-only fs are void.
+        // patch(sulrim): a shader without fragment_func is a depth-only caster
+        // and gets no fragment state (Metal: nil fragmentFunction). one WITH a
+        // fragment stage keeps it even at ZERO color targets: shadow_fade.fs
+        // dithers the caster fade with discard, and dropping the stage silently
+        // made every shadow dissolve a snap on webgpu while metal faded.
+        // targetCount 0 is legal: the depth attachment is the pipeline's own.
         if (shd->wgpu.fragment_func.module) {
             wgpu_frag_state.module = shd->wgpu.fragment_func.module;
             wgpu_frag_state.entryPoint = _sg_wgpu_stringview(shd->wgpu.fragment_func.entry.buf);
@@ -24043,13 +24045,18 @@ _SOKOL_PRIVATE bool _sg_validate_shader_desc(const sg_shader_desc* desc) {
         _sg_validate_begin();
         _SG_VALIDATE(desc->_start_canary == 0, VALIDATE_SHADERDESC_CANARY);
         _SG_VALIDATE(desc->_end_canary == 0, VALIDATE_SHADERDESC_CANARY);
+        // patch(sulrim): fragment_func is optional for render shaders on Metal,
+        // D3D11 and WebGPU: a shader without one builds depth-only pipelines
+        // that run no fragment stage. GL keeps the requirement (program link)
         #if defined(SOKOL_GLCORE) || defined(SOKOL_GLES3) || defined(SOKOL_WGPU)
             // on GL or WebGPU, must provide shader source code
             if (is_compute_shader) {
                 _SG_VALIDATE(0 != desc->compute_func.source, VALIDATE_SHADERDESC_COMPUTE_SOURCE);
             } else {
                 _SG_VALIDATE(0 != desc->vertex_func.source, VALIDATE_SHADERDESC_VERTEX_SOURCE);
+                #if !defined(SOKOL_WGPU)
                 _SG_VALIDATE(0 != desc->fragment_func.source, VALIDATE_SHADERDESC_FRAGMENT_SOURCE);
+                #endif
             }
         #elif defined(SOKOL_METAL) || defined(SOKOL_D3D11)
             // on Metal or D3D11, must provide shader source code or byte code
@@ -24057,7 +24064,6 @@ _SOKOL_PRIVATE bool _sg_validate_shader_desc(const sg_shader_desc* desc) {
                 _SG_VALIDATE((0 != desc->compute_func.source) || (0 != desc->compute_func.bytecode.ptr), VALIDATE_SHADERDESC_COMPUTE_SOURCE_OR_BYTECODE);
             } else {
                 _SG_VALIDATE((0 != desc->vertex_func.source)|| (0 != desc->vertex_func.bytecode.ptr), VALIDATE_SHADERDESC_VERTEX_SOURCE_OR_BYTECODE);
-                _SG_VALIDATE((0 != desc->fragment_func.source) || (0 != desc->fragment_func.bytecode.ptr), VALIDATE_SHADERDESC_FRAGMENT_SOURCE_OR_BYTECODE);
             }
         #else
             // Dummy Backend, don't require source or bytecode
