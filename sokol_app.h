@@ -2229,8 +2229,6 @@ SOKOL_APP_API_DECL uint32_t sapp_html5_get_dropped_file_size(int index);
 /* HTML5: asynchronously load the content of a dropped file */
 SOKOL_APP_API_DECL void sapp_html5_fetch_dropped_file(const sapp_html5_fetch_request* request);
 
-/* PATCH(sulrim) runtime render scale (0.25..1): framebuffer = window * dpi * scale */
-SOKOL_APP_API_DECL void sapp_set_render_scale(float scale);
 /* macOS: get bridged pointer to macOS NSWindow */
 SOKOL_APP_API_DECL const void* sapp_macos_get_window(void);
 /* macOS+Metal: PATCH(sulrim) runtime DisplayLink fps cap, 0 = display max (battery saver) */
@@ -3281,7 +3279,6 @@ typedef struct {
     int sample_count;
     int swap_interval;
     float dpi_scale;
-    float render_scale; // PATCH(sulrim): sapp_set_render_scale, multiplies dpi_scale
     uint64_t frame_count;
     sapp_event event;
     _sapp_mouse_t mouse;
@@ -3589,7 +3586,6 @@ _SOKOL_PRIVATE void _sapp_init_state(const sapp_desc* desc) {
     _sapp_strcpy(_sapp.desc.window_title, _sapp.window_title, sizeof(_sapp.window_title));
     _sapp.desc.window_title = _sapp.window_title;
     _sapp.dpi_scale = 1.0f;
-    _sapp.render_scale = 1.0f; // PATCH(sulrim)
     _sapp.fullscreen = _sapp.desc.fullscreen;
     _sapp.mouse.shown = true;
     _sapp_timing_init(&_sapp.timing);
@@ -5672,7 +5668,6 @@ _SOKOL_PRIVATE void _sapp_macos_init_default_dimensions(void) {
     } else {
         _sapp.dpi_scale = 1.0f;
     }
-    _sapp.dpi_scale *= _sapp.render_scale; // PATCH(sulrim)
     NSRect screen_rect = NSScreen.mainScreen.frame;
     // use 4/5 of screen size as default size
     const float default_widthf = (screen_rect.size.width * 4.0f) / 5.0f;
@@ -5697,9 +5692,9 @@ _SOKOL_PRIVATE void _sapp_macos_update_dimensions(void) {
     } else {
         _sapp.dpi_scale = 1.0f;
     }
-    // PATCH(sulrim): runtime render scale shrinks the drawable below the
-    // backing scale; the layer stretches it back over the same bounds
-    _sapp.dpi_scale *= _sapp.render_scale;
+    // PATCH(sulrim) NATIVE-RES LAW (owner's order, never break): the drawable
+    // is the backing scale, never multiplied down. Only the 3D scene scales
+    // (scene_grade.h 3D DPR); UI and text stay native
     // NOTE: needed because we set layerContentsPlacement to a non-scaling value in windowWillStartLiveResize.
     _sapp.macos.view.layer.contentsScale = _sapp.dpi_scale;
     const NSRect bounds = [_sapp.macos.view bounds];
@@ -7559,21 +7554,14 @@ _SOKOL_PRIVATE uint32_t _sapp_emsc_touch_event_mods(const EmscriptenTouchEvent* 
     return m;
 }
 
-// PATCH(sulrim): single place computing dpi_scale on the web.
-// 1) clamps DPR to 2: DPR-3 phones pay ~2.25x fragment fill for no visible
-//    gain (main heat source). Mirrored in renderer.ts watchCanvasSize.
-// 2) folds in the runtime render scale (sapp_set_render_scale).
-// Input coords are dpi_scale-derived too, so framebuffer, input and the
-// dpi-based UI layout all stay consistent whatever the scale.
+// PATCH(sulrim): single place computing dpi_scale on the web, mirrored in
+// renderer.ts watchCanvasSize.
+// NATIVE-RES LAW (owner's order, never break): the full device DPR, no cap,
+// no runtime render / dpi / framebuffer scale, no Resolution setting. Only the
+// 3D scene may scale (scene_grade.h 3D DPR). DPR-2 cap removed 2026-10-23.
 _SOKOL_PRIVATE void _sapp_emsc_update_dpi_scale(void) {
-    float dpi_scale = 1.0f;
-    if (_sapp.desc.high_dpi) {
-        dpi_scale = (float) emscripten_get_device_pixel_ratio();
-        if (dpi_scale > 2.0f) {
-            dpi_scale = 2.0f;
-        }
-    }
-    _sapp.dpi_scale = dpi_scale * _sapp.render_scale;
+    _sapp.dpi_scale = _sapp.desc.high_dpi
+        ? (float) emscripten_get_device_pixel_ratio() : 1.0f;
 }
 
 _SOKOL_PRIVATE EM_BOOL _sapp_emsc_size_changed(int event_type, const EmscriptenUiEvent* ui_event, void* user_data) {
@@ -14544,38 +14532,6 @@ SOKOL_API_IMPL sapp_swapchain sapp_get_swapchain(void) {
     res.depth_format = sapp_depth_format();
     res.sample_count = sapp_sample_count();
     return res;
-}
-
-// PATCH(sulrim): runtime render scale for the game's quality setting. The
-// framebuffer shrinks (fewer shaded pixels on a weak gpu) while the window /
-// canvas keeps its size and the compositor upscales. Everything else is
-// derived from dpi_scale (input coords, the game's UI layout), so no call
-// site needs to know. Must not be called while a render pass is recording:
-// it resizes the swapchain.
-SOKOL_API_IMPL void sapp_set_render_scale(float scale) {
-    if (scale < 0.25f) { scale = 0.25f; }
-    if (scale > 1.0f) { scale = 1.0f; }
-    if (_sapp.render_scale == scale) { return; }
-    _sapp.render_scale = scale;
-    if (!_sapp.valid) { return; } // picked up by the init-time dpi math
-    #if defined(_SAPP_MACOS)
-        #if defined(SOKOL_METAL)
-            // the layer default is kCAFilterNearest: a reduced drawable would
-            // upscale into raw blocks
-            _sapp.macos.mtl.layer.magnificationFilter =
-                (scale < 1.0f) ? kCAFilterLinear : kCAFilterNearest;
-        #endif
-        _sapp_macos_update_dimensions();
-    #elif defined(_SAPP_EMSCRIPTEN)
-        double w, h;
-        emscripten_get_element_css_size(_sapp.html5_canvas_selector, &w, &h);
-        // a zero css size means a fullscreen toggle is mid-flight, and the
-        // resize path would need the event's window size: leave it to the
-        // resize event that follows (it re-reads render_scale anyway)
-        if ((w >= 1.0) && (h >= 1.0)) {
-            _sapp_emsc_size_changed(EMSCRIPTEN_EVENT_RESIZE, 0, 0);
-        }
-    #endif
 }
 
 SOKOL_API_IMPL const void* sapp_macos_get_window(void) {
