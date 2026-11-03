@@ -5573,10 +5573,25 @@ _SOKOL_PRIVATE void _sapp_macos_init_cursors(void) {
     _sapp.macos.standard_cursors[SAPP_MOUSECURSOR_NOT_ALLOWED] = [NSCursor operationNotAllowedCursor];
 }
 
+// PATCH(sulrim): unattended runs (cape scene, headless build, SULRIM_WINDOW_QUIET=1) never
+// activate, take the front slot or switch Space: Accessory from launch, alpha 0, ordered back
+_SOKOL_PRIVATE bool _sapp_macos_is_quiet(void) {
+    #if defined(GAME_CAPE_VALIDATION)
+        return true;
+    #else
+        const char* v = getenv("SULRIM_WINDOW_QUIET");
+        return v && v[0] == '1';
+    #endif
+}
+
 _SOKOL_PRIVATE void _sapp_macos_run(const sapp_desc* desc) {
     _sapp_init_state(desc);
     _sapp_macos_init_keytable();
     [NSApplication sharedApplication];
+    // PATCH(sulrim): before run's finishLaunching, which fronts a Regular app (~1 s)
+    if (_sapp_macos_is_quiet()) {
+        NSApp.activationPolicy = NSApplicationActivationPolicyAccessory;
+    }
 
     // set the application dock icon as early as possible, otherwise
     // the dummy icon will be visible for a short time
@@ -5933,13 +5948,8 @@ _SOKOL_PRIVATE void _sapp_macos_frame(void) {
 - (void)applicationDidFinishLaunching:(NSNotification*)aNotification {
     _SOKOL_UNUSED(aNotification);
     // NOTE: keep activationPolicy in front of window creation (see https://github.com/floooh/sokol/issues/1500)
-    #if defined(GAME_CAPE_VALIDATION)
-        // PATCH(sulrim): the automated Metal cape scene must never activate or
-        // move the developer to its Space while it renders.
-        NSApp.activationPolicy = NSApplicationActivationPolicyAccessory;
-    #else
-        NSApp.activationPolicy = NSApplicationActivationPolicyRegular;
-    #endif
+    const bool is_quiet = _sapp_macos_is_quiet();
+    NSApp.activationPolicy = is_quiet ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular;
     _sapp_macos_init_cursors();
     if ((_sapp.window_width == 0) || (_sapp.window_height == 0)) {
         _sapp_macos_init_default_dimensions();
@@ -5972,7 +5982,7 @@ _SOKOL_PRIVATE void _sapp_macos_frame(void) {
     _sapp.macos.window.contentView = _sapp.macos.view;
     [_sapp.macos.window makeFirstResponder:_sapp.macos.view];
     [_sapp.macos.window center];
-    #if defined(GAME_CAPE_VALIDATION)
+    if (is_quiet) {
         // PATCH(sulrim): keep the CAMetalLayer ordered and drawable, but never
         // cover the developer's work or accept an accidental click.
         _sapp.macos.window.alphaValue = 0.0;
@@ -5981,24 +5991,24 @@ _SOKOL_PRIVATE void _sapp_macos_frame(void) {
             NSWindowCollectionBehaviorCanJoinAllSpaces |
             NSWindowCollectionBehaviorStationary |
             NSWindowCollectionBehaviorIgnoresCycle;
-    #endif
+    }
     _sapp.valid = true;
     if (_sapp.fullscreen) {
         /* ^^^ on GL, this already toggles a rendered frame, so set the valid flag before */
         [_sapp.macos.window toggleFullScreen:self];
     }
-    #if defined(GAME_CAPE_VALIDATION)
+    if (is_quiet) {
         [_sapp.macos.window orderBack:nil];
-    #else
+    } else {
         [NSApp activateIgnoringOtherApps:YES];
         [_sapp.macos.window makeKeyAndOrderFront:nil];
-    #endif
+    }
     _sapp_macos_update_dimensions();
 
     // workaround for window not being focused during a long init callback
     // for details see: https://github.com/floooh/sokol/pull/982
     // also see: https://gitlab.gnome.org/GNOME/gtk/-/issues/2342
-    #if !defined(GAME_CAPE_VALIDATION)
+    if (!is_quiet) {
         NSEvent *focusevent = [NSEvent otherEventWithType:NSEventTypeAppKitDefined
             location:NSZeroPoint
             modifierFlags:0x40
@@ -6009,7 +6019,7 @@ _SOKOL_PRIVATE void _sapp_macos_frame(void) {
             data1:0
             data2:0];
         [NSApp postEvent:focusevent atStart:YES];
-    #endif
+    }
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
