@@ -5075,6 +5075,8 @@ typedef struct sg_frame_stats_wgpu_bindings {
 } sg_frame_stats_wgpu_bindings;
 
 typedef struct sg_frame_stats_wgpu {
+    uint32_t num_set_blend_constant;
+    uint32_t num_set_stencil_reference;
     sg_frame_stats_wgpu_uniforms uniforms;
     sg_frame_stats_wgpu_bindings bindings;
 } sg_frame_stats_wgpu;
@@ -5126,7 +5128,10 @@ typedef struct sg_frame_stats {
     uint32_t num_apply_scissor_rect;
     uint32_t num_apply_pipeline;
     uint32_t num_apply_bindings;
-    uint32_t num_apply_uniforms;
+    uint32_t num_apply_uniforms; // includes cached applies
+    uint32_t num_apply_uniforms_cached;
+    uint32_t num_reuse_uniforms;
+    uint32_t size_reuse_uniforms; // payload bytes, not ring allocation bytes
     uint32_t num_draw;
     uint32_t num_draw_ex;
     uint32_t num_draw_indirect;          // Encoded commands, including GPU-zero counts.
@@ -5264,7 +5269,7 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(METAL_CREATE_TEXTUREVIEW_FAILED, "failed to create texture view object (metal)") \
     _SG_LOGITEM_XMACRO(WGPU_RETIREMENT_QUEUE_FULL, "owned-resource retirement queue full; commit or increase sg_desc.wgpu.retirement_queue_size") \
     _SG_LOGITEM_XMACRO(WGPU_BINDGROUPS_POOL_EXHAUSTED, "bindgroups pool exhausted (increase sg_desc.bindgroups_cache_size) (wgpu)") \
-    _SG_LOGITEM_XMACRO(WGPU_BINDGROUPSCACHE_SIZE_GREATER_ONE, "sg_desc.wgpu.bindgroups_cache_size must be > 1 (wgpu)") \
+    _SG_LOGITEM_XMACRO(WGPU_BINDGROUPSCACHE_SIZE_TOO_SMALL, "sg_desc.wgpu.bindgroups_cache_size must be >= 8 (wgpu)") \
     _SG_LOGITEM_XMACRO(WGPU_BINDGROUPSCACHE_SIZE_POW2, "sg_desc.wgpu.bindgroups_cache_size must be a power of 2 (wgpu)") \
     _SG_LOGITEM_XMACRO(WGPU_CREATEBINDGROUP_FAILED, "wgpuDeviceCreateBindGroup failed") \
     _SG_LOGITEM_XMACRO(WGPU_CREATE_BUFFER_FAILED, "wgpuDeviceCreateBuffer() failed") \
@@ -5707,6 +5712,7 @@ typedef struct sg_stats {
     _SG_LOGITEM_XMACRO(VALIDATE_AU_PIPELINE_SHADER_VALID, "sg_apply_uniforms: shader associated with currently applied pipeline is not in valid state") \
     _SG_LOGITEM_XMACRO(VALIDATE_AU_NO_UNIFORMBLOCK_AT_SLOT, "sg_apply_uniforms: no uniform block declaration at this shader stage UB slot") \
     _SG_LOGITEM_XMACRO(VALIDATE_AU_SIZE, "sg_apply_uniforms: data size doesn't match declared uniform block size") \
+    _SG_LOGITEM_XMACRO(VALIDATE_AU_CACHED_SIZE, "sg_apply_uniforms_cached: data_id was applied with another size in this commit") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_RENDERPASS_EXPECTED, "sg_draw: must be called in a render pass") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_BASEELEMENT_GE_ZERO, "sg_draw: base_element cannot be < 0") \
     _SG_LOGITEM_XMACRO(VALIDATE_DRAW_NUMELEMENTS_GE_ZERO, "sg_draw: num_elements cannot be < 0") \
@@ -6066,7 +6072,7 @@ typedef struct sg_metal_desc {
 typedef struct sg_wgpu_desc {
     int retirement_queue_size;     // owned buffers/images awaiting Destroy; default: buffer + image pool sizes
     bool disable_bindgroups_cache; // set to true to disable the WebGPU backend BindGroup cache
-    int bindgroups_cache_size;     // number of slots in the WebGPU bindgroup cache (must be 2^N)
+    int bindgroups_cache_size;     // number of slots in the WebGPU bindgroup cache (must be 2^N, >= 8)
 } sg_wgpu_desc;
 
 typedef struct sg_vulkan_desc {
@@ -6131,6 +6137,10 @@ SOKOL_GFX_API_DECL void sg_apply_scissor_rectf(float x, float y, float width, fl
 SOKOL_GFX_API_DECL void sg_apply_pipeline(sg_pipeline pip);
 SOKOL_GFX_API_DECL void sg_apply_bindings(const sg_bindings* bindings);
 SOKOL_GFX_API_DECL void sg_apply_uniforms(int ub_slot, const sg_range* data);
+/* Immutable payload IDs survive setup/shutdown. Allocate a new ID for changed bytes or size. */
+SOKOL_GFX_API_DECL uint64_t sg_alloc_uniform_data_id(void);
+/* Metal/WebGPU reuse a commit-local ring range across shaders/slots with equal declared size. Other backends copy. Validation and traces run; no source pointer is retained. */
+SOKOL_GFX_API_DECL void sg_apply_uniforms_cached(int ub_slot, const sg_range* data, uint64_t data_id);
 SOKOL_GFX_API_DECL void sg_draw(int base_element, int num_elements, int num_instances);
 SOKOL_GFX_API_DECL void sg_draw_ex(int base_element, int num_elements, int num_instances, int base_vertex, int base_instance);
 // Portable argument layouts: first_instance must be zero on WebGPU without its optional feature.
@@ -6463,6 +6473,7 @@ inline sg_view sg_make_view(const sg_view_desc& desc) { return sg_make_view(&des
 inline void sg_begin_pass(const sg_pass& pass) { return sg_begin_pass(&pass); }
 inline void sg_apply_bindings(const sg_bindings& bindings) { return sg_apply_bindings(&bindings); }
 inline void sg_apply_uniforms(int ub_slot, const sg_range& data) { return sg_apply_uniforms(ub_slot, &data); }
+inline void sg_apply_uniforms_cached(int ub_slot, const sg_range& data, uint64_t data_id) { return sg_apply_uniforms_cached(ub_slot, &data, data_id); }
 
 inline sg_buffer_desc sg_query_buffer_defaults(const sg_buffer_desc& desc) { return sg_query_buffer_defaults(&desc); }
 inline sg_image_desc sg_query_image_defaults(const sg_image_desc& desc) { return sg_query_image_defaults(&desc); }
@@ -7977,6 +7988,7 @@ typedef struct _sg_shader_s {
         WGPUBindGroupLayout bgl_ub;
         WGPUBindGroup bg_ub;
         WGPUBindGroupLayout bgl_view_smp;
+        WGPUBindGroup bg_view_smp_empty; // Safari requires non-null groups at empty layout slots.
         // a mapping of sokol-gfx bind slots to setBindGroup dynamic-offset-array indices
         uint8_t ub_num_dynoffsets;
         uint8_t ub_dynoffsets[SG_MAX_UNIFORMBLOCK_BINDSLOTS];
@@ -8028,7 +8040,7 @@ typedef enum {
     _SG_WGPU_BINDGROUPSCACHEITEMTYPE_NONE     = 0,
     _SG_WGPU_BINDGROUPSCACHEITEMTYPE_VIEW     = 1,
     _SG_WGPU_BINDGROUPSCACHEITEMTYPE_SAMPLER  = 2,
-    _SG_WGPU_BINDGROUPSCACHEITEMTYPE_PIPELINE = 3,
+    _SG_WGPU_BINDGROUPSCACHEITEMTYPE_SHADER = 3,
     // update as needed
     _SG_WGPU_BINDGROUPSCACHEITEMTYPE_MASK     = 3,
 } _sg_wgpu_bindgroups_cache_item_type_t;
@@ -8047,9 +8059,11 @@ typedef struct {
     uint64_t items[_SG_WGPU_BINDGROUPSCACHEKEY_NUM_ITEMS];
 } _sg_wgpu_bindgroups_cache_key_t;
 
+// Eight ways, valid entries form a most-recent-first prefix.
+#define _SG_WGPU_BINDGROUPSCACHE_WAYS (8)
 typedef struct {
     uint32_t num;           // must be 2^n
-    uint32_t index_mask;    // mask to turn hash into valid index
+    uint32_t index_mask;    // mask to the first way of a set
     _sg_wgpu_bindgroup_handle_t* items;
 } _sg_wgpu_bindgroups_cache_t;
 
@@ -8104,6 +8118,11 @@ typedef struct {
     WGPUComputePassEncoder cpass_enc;
     _sg_wgpu_uniform_system_t uniform;
     _sg_wgpu_bindings_cache_t bindings_cache;
+    struct {
+        bool is_valid;
+        WGPUColor blend_color;
+        uint32_t stencil_ref;
+    } render_state_cache;
     _sg_wgpu_bindgroups_cache_t bindgroups_cache;
     _sg_wgpu_bindgroups_pool_t bindgroups_pool;
     _sg_wgpu_retirement_t retirement;
@@ -8395,10 +8414,25 @@ typedef struct {
     bool write;
 } _sg_pixelformat_info_t;
 
+#if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+// Commit-local ring ranges by immutable ID; a collision costs one copy.
+#define _SG_UNIFORM_CACHE_SIZE (256)
+typedef struct {
+    uint64_t frame;
+    uint64_t data_id;
+    uint32_t offset;
+    uint32_t size;
+} _sg_uniform_cache_entry_t;
+#endif
+
 typedef struct {
     bool valid;
     sg_desc desc;       // original desc with default values patched in
     uint32_t frame_index;
+    uint64_t uniform_cache_frame;
+    #if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+    _sg_uniform_cache_entry_t uniform_cache[_SG_UNIFORM_CACHE_SIZE];
+    #endif
     struct {
         bool valid;
         bool in_pass;
@@ -18584,6 +18618,31 @@ _SOKOL_PRIVATE bool _sg_mtl_apply_bindings(_sg_bindings_ptrs_t* bnd) {
     return true;
 }
 
+_SOKOL_PRIVATE void _sg_mtl_bind_uniforms(int ub_slot, uint32_t offset) {
+    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+    SOKOL_ASSERT(pip);
+    const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+
+    const sg_shader_stage stage = shd->cmn.uniform_blocks[ub_slot].stage;
+    const NSUInteger mtl_slot = shd->mtl.ub_buffer_n[ub_slot];
+
+    if (stage == SG_SHADERSTAGE_VERTEX) {
+        SOKOL_ASSERT(nil != _sg.mtl.render_cmd_encoder);
+        [_sg.mtl.render_cmd_encoder setVertexBufferOffset:(NSUInteger)offset atIndex:mtl_slot];
+        _sg_stats_inc(metal.uniforms.num_set_vertex_buffer_offset);
+    } else if (stage == SG_SHADERSTAGE_FRAGMENT) {
+        SOKOL_ASSERT(nil != _sg.mtl.render_cmd_encoder);
+        [_sg.mtl.render_cmd_encoder setFragmentBufferOffset:(NSUInteger)offset atIndex:mtl_slot];
+        _sg_stats_inc(metal.uniforms.num_set_fragment_buffer_offset);
+    } else if (stage == SG_SHADERSTAGE_COMPUTE) {
+        SOKOL_ASSERT(nil != _sg.mtl.compute_cmd_encoder);
+        [_sg.mtl.compute_cmd_encoder setBufferOffset:(NSUInteger)offset atIndex:mtl_slot];
+        _sg_stats_inc(metal.uniforms.num_set_compute_buffer_offset);
+    } else {
+        SOKOL_UNREACHABLE;
+    }
+}
+
 _SOKOL_PRIVATE void _sg_mtl_apply_uniforms(int ub_slot, const sg_range* data) {
     SOKOL_ASSERT((ub_slot >= 0) && (ub_slot < SG_MAX_UNIFORMBLOCK_BINDSLOTS));
     SOKOL_ASSERT(((size_t)_sg.mtl.cur_ub_offset + data->size) <= (size_t)_sg.mtl.ub_size);
@@ -18592,28 +18651,10 @@ _SOKOL_PRIVATE void _sg_mtl_apply_uniforms(int ub_slot, const sg_range* data) {
     SOKOL_ASSERT(pip);
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
     SOKOL_ASSERT(data->size == shd->cmn.uniform_blocks[ub_slot].size);
+    _SOKOL_UNUSED(shd);
 
-    const sg_shader_stage stage = shd->cmn.uniform_blocks[ub_slot].stage;
-    const NSUInteger mtl_slot = shd->mtl.ub_buffer_n[ub_slot];
-
-    // copy to global uniform buffer, record offset into cmd encoder, and advance offset
-    uint8_t* dst = &_sg.mtl.cur_ub_base_ptr[_sg.mtl.cur_ub_offset];
-    memcpy(dst, data->ptr, data->size);
-    if (stage == SG_SHADERSTAGE_VERTEX) {
-        SOKOL_ASSERT(nil != _sg.mtl.render_cmd_encoder);
-        [_sg.mtl.render_cmd_encoder setVertexBufferOffset:(NSUInteger)_sg.mtl.cur_ub_offset atIndex:mtl_slot];
-        _sg_stats_inc(metal.uniforms.num_set_vertex_buffer_offset);
-    } else if (stage == SG_SHADERSTAGE_FRAGMENT) {
-        SOKOL_ASSERT(nil != _sg.mtl.render_cmd_encoder);
-        [_sg.mtl.render_cmd_encoder setFragmentBufferOffset:(NSUInteger)_sg.mtl.cur_ub_offset atIndex:mtl_slot];
-        _sg_stats_inc(metal.uniforms.num_set_fragment_buffer_offset);
-    } else if (stage == SG_SHADERSTAGE_COMPUTE) {
-        SOKOL_ASSERT(nil != _sg.mtl.compute_cmd_encoder);
-        [_sg.mtl.compute_cmd_encoder setBufferOffset:(NSUInteger)_sg.mtl.cur_ub_offset atIndex:mtl_slot];
-        _sg_stats_inc(metal.uniforms.num_set_compute_buffer_offset);
-    } else {
-        SOKOL_UNREACHABLE;
-    }
+    memcpy(&_sg.mtl.cur_ub_base_ptr[_sg.mtl.cur_ub_offset], data->ptr, data->size);
+    _sg_mtl_bind_uniforms(ub_slot, (uint32_t)_sg.mtl.cur_ub_offset);
     _sg.mtl.cur_ub_offset = _sg_roundup_pow2(_sg.mtl.cur_ub_offset + (int)data->size, _SG_MTL_UB_ALIGN);
 }
 
@@ -19580,7 +19621,8 @@ _SOKOL_PRIVATE void _sg_wgpu_uniform_system_set_bindgroup(void) {
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_apply_pipeline(void) {
-    _sg.wgpu.uniform.dirty = false;
+    // Bind even zero-block layouts at the next draw/dispatch for Safari.
+    _sg.wgpu.uniform.dirty = true;
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_commit(void) {
@@ -19700,8 +19742,8 @@ _SOKOL_PRIVATE uint64_t _sg_wgpu_bindgroups_cache_item(_sg_wgpu_bindgroups_cache
     return (bb << 56) | (t << 54) | (ccccc << 32) | iiiiiiii;
 }
 
-_SOKOL_PRIVATE uint64_t _sg_wgpu_bindgroups_cache_pip_item(const _sg_slot_t* slot) {
-    return _sg_wgpu_bindgroups_cache_item(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_PIPELINE, 0xFF, slot->id, slot->uninit_count);
+_SOKOL_PRIVATE uint64_t _sg_wgpu_bindgroups_cache_shader_item(const _sg_slot_t* slot) {
+    return _sg_wgpu_bindgroups_cache_item(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_SHADER, 0xFF, slot->id, slot->uninit_count);
 }
 
 _SOKOL_PRIVATE uint64_t _sg_wgpu_bindgroups_cache_view_item(uint8_t wgpu_binding, const _sg_slot_t* slot) {
@@ -19718,7 +19760,7 @@ _SOKOL_PRIVATE void _sg_wgpu_init_bindgroups_cache_key(_sg_wgpu_bindgroups_cache
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&bnd->pip->cmn.shader);
 
     _sg_clear(key->items, sizeof(key->items));
-    key->items[0] = _sg_wgpu_bindgroups_cache_pip_item(&bnd->pip->slot);
+    key->items[0] = _sg_wgpu_bindgroups_cache_shader_item(&shd->slot);
     for (size_t i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
         if (shd->cmn.views[i].stage == SG_SHADERSTAGE_NONE) {
             continue;
@@ -19857,14 +19899,14 @@ _SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_init(const sg_desc* desc) {
     SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.index_mask == 0);
     SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.items == 0);
     const int num = desc->wgpu.bindgroups_cache_size;
-    if (num <= 1) {
-        _SG_PANIC(WGPU_BINDGROUPSCACHE_SIZE_GREATER_ONE);
+    if (num < _SG_WGPU_BINDGROUPSCACHE_WAYS) {
+        _SG_PANIC(WGPU_BINDGROUPSCACHE_SIZE_TOO_SMALL);
     }
     if (!_sg_ispow2(num)) {
         _SG_PANIC(WGPU_BINDGROUPSCACHE_SIZE_POW2);
     }
     _sg.wgpu.bindgroups_cache.num = (uint32_t)desc->wgpu.bindgroups_cache_size;
-    _sg.wgpu.bindgroups_cache.index_mask = _sg.wgpu.bindgroups_cache.num - 1;
+    _sg.wgpu.bindgroups_cache.index_mask = (_sg.wgpu.bindgroups_cache.num - 1) & ~(uint32_t)(_SG_WGPU_BINDGROUPSCACHE_WAYS - 1);
     size_t size_in_bytes = sizeof(_sg_wgpu_bindgroup_handle_t) * (size_t)num;
     _sg.wgpu.bindgroups_cache.items = (_sg_wgpu_bindgroup_handle_t*)_sg_malloc_clear(size_in_bytes);
 }
@@ -19878,18 +19920,25 @@ _SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_discard(void) {
     _sg.wgpu.bindgroups_cache.index_mask = 0;
 }
 
-_SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_set(uint64_t hash, uint32_t bg_id) {
-    uint32_t index = hash & _sg.wgpu.bindgroups_cache.index_mask;
-    SOKOL_ASSERT(index < _sg.wgpu.bindgroups_cache.num);
+_SOKOL_PRIVATE _sg_wgpu_bindgroup_handle_t* _sg_wgpu_bindgroups_cache_ways(uint64_t hash) {
+    uint32_t index = (uint32_t)hash & _sg.wgpu.bindgroups_cache.index_mask;
+    SOKOL_ASSERT((index + _SG_WGPU_BINDGROUPSCACHE_WAYS) <= _sg.wgpu.bindgroups_cache.num);
     SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.items);
-    _sg.wgpu.bindgroups_cache.items[index].id = bg_id;
+    return &_sg.wgpu.bindgroups_cache.items[index];
 }
 
-_SOKOL_PRIVATE uint32_t _sg_wgpu_bindgroups_cache_get(uint64_t hash) {
-    uint32_t index = hash & _sg.wgpu.bindgroups_cache.index_mask;
+_SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_promote(_sg_wgpu_bindgroup_handle_t* ways, int way, uint32_t bg_id) {
+    SOKOL_ASSERT((way >= 0) && (way < _SG_WGPU_BINDGROUPSCACHE_WAYS));
+    memmove(&ways[1], &ways[0], (size_t)way * sizeof(ways[0]));
+    ways[0].id = bg_id;
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_remove(uint32_t index) {
     SOKOL_ASSERT(index < _sg.wgpu.bindgroups_cache.num);
-    SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.items);
-    return _sg.wgpu.bindgroups_cache.items[index].id;
+    _sg_wgpu_bindgroup_handle_t* items = _sg.wgpu.bindgroups_cache.items;
+    const uint32_t last = index | (_SG_WGPU_BINDGROUPSCACHE_WAYS - 1);
+    memmove(&items[index], &items[index + 1], (size_t)(last - index) * sizeof(items[0]));
+    items[last].id = SG_INVALID_ID;
 }
 
 // called from wgpu resource destroy functions to also invalidate any
@@ -19899,7 +19948,7 @@ _SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_invalidate(_sg_wgpu_bindgroups_cac
     const uint64_t key_mask = _sg_wgpu_bindgroups_cache_item(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_MASK, 0, 0xFFFFFFFF, 0xFFFFFFFF);
     const uint64_t key_item = _sg_wgpu_bindgroups_cache_item(type, 0, slot->id, slot->uninit_count) & key_mask;
     SOKOL_ASSERT(_sg.wgpu.bindgroups_cache.items);
-    for (uint32_t cache_item_idx = 0; cache_item_idx < _sg.wgpu.bindgroups_cache.num; cache_item_idx++) {
+    for (uint32_t cache_item_idx = _sg.wgpu.bindgroups_cache.num; cache_item_idx-- > 0;) {
         const uint32_t bg_id = _sg.wgpu.bindgroups_cache.items[cache_item_idx].id;
         if (bg_id != SG_INVALID_ID) {
             _sg_wgpu_bindgroup_t* bg = _sg_wgpu_lookup_bindgroup(bg_id);
@@ -19914,7 +19963,7 @@ _SOKOL_PRIVATE void _sg_wgpu_bindgroups_cache_invalidate(_sg_wgpu_bindgroups_cac
             }
             if (invalidate_cache_item) {
                 _sg_wgpu_discard_bindgroup(bg); bg = 0;
-                _sg_wgpu_bindgroups_cache_set(cache_item_idx, SG_INVALID_ID);
+                _sg_wgpu_bindgroups_cache_remove(cache_item_idx);
                 _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_invalidates);
             }
         }
@@ -19985,27 +20034,16 @@ _SOKOL_PRIVATE void _sg_wgpu_bindings_cache_bg_update(const _sg_wgpu_bindgroup_t
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_set_bindgroup(uint32_t bg_idx, _sg_wgpu_bindgroup_t* bg) {
+    SOKOL_ASSERT(bg && (bg->slot.state == SG_RESOURCESTATE_VALID) && bg->bindgroup);
     if (_sg_wgpu_bindings_cache_bg_dirty(bg)) {
         _sg_wgpu_bindings_cache_bg_update(bg);
         _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
         if (_sg.cur_pass.is_compute) {
             SOKOL_ASSERT(_sg.wgpu.cpass_enc);
-            if (bg) {
-                SOKOL_ASSERT(bg->slot.state == SG_RESOURCESTATE_VALID);
-                SOKOL_ASSERT(bg->bindgroup);
-                wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, bg_idx, bg->bindgroup, 0, 0);
-            } else {
-                wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, bg_idx, 0, 0, 0);
-            }
+            wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, bg_idx, bg->bindgroup, 0, 0);
         } else {
             SOKOL_ASSERT(_sg.wgpu.rpass_enc);
-            if (bg) {
-                SOKOL_ASSERT(bg->slot.state == SG_RESOURCESTATE_VALID);
-                SOKOL_ASSERT(bg->bindgroup);
-                wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, bg_idx, bg->bindgroup, 0, 0);
-            } else {
-                wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, bg_idx, 0, 0, 0);
-            }
+            wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, bg_idx, bg->bindgroup, 0, 0);
         }
     } else {
         _sg_stats_inc(wgpu.bindings.num_skip_redundant_bindgroup);
@@ -20017,37 +20055,37 @@ _SOKOL_PRIVATE bool _sg_wgpu_apply_bindings_bindgroup(_sg_bindings_ptrs_t* bnd) 
         _sg_wgpu_bindgroup_t* bg = 0;
         _sg_wgpu_bindgroups_cache_key_t key;
         _sg_wgpu_init_bindgroups_cache_key(&key, bnd);
-        uint32_t bg_id = _sg_wgpu_bindgroups_cache_get(key.hash);
-        if (bg_id != SG_INVALID_ID) {
-            // potential cache hit
-            bg = _sg_wgpu_lookup_bindgroup(bg_id);
+        _sg_wgpu_bindgroup_handle_t* ways = _sg_wgpu_bindgroups_cache_ways(key.hash);
+        int way = 0;
+        for (; (way < _SG_WGPU_BINDGROUPSCACHE_WAYS) && (ways[way].id != SG_INVALID_ID); way++) {
+            bg = _sg_wgpu_lookup_bindgroup(ways[way].id);
             SOKOL_ASSERT(bg && (bg->slot.state == SG_RESOURCESTATE_VALID));
-            if (!_sg_wgpu_compare_bindgroups_cache_key(&key, &bg->key)) {
-                // cache collision, need to delete cached bindgroup
-                _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_collisions);
-                _sg_wgpu_discard_bindgroup(bg);
-                _sg_wgpu_bindgroups_cache_set(key.hash, SG_INVALID_ID);
-                bg = 0;
-            } else {
-                _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_hits);
+            if (_sg_wgpu_compare_bindgroups_cache_key(&key, &bg->key)) {
+                break;
             }
-        } else {
-            _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_misses);
+            bg = 0;
         }
-        if (bg == 0) {
-            // either no cache entry yet, or cache collision, create new bindgroup and store in cache
+        if (bg) {
+            _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_hits);
+        } else {
+            if (way == _SG_WGPU_BINDGROUPSCACHE_WAYS) {
+                _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_collisions);
+                way--;
+                _sg_wgpu_discard_bindgroup(_sg_wgpu_lookup_bindgroup(ways[way].id));
+                ways[way].id = SG_INVALID_ID;
+            } else {
+                _sg_stats_inc(wgpu.bindings.num_bindgroup_cache_misses);
+            }
             bg = _sg_wgpu_create_bindgroup(bnd);
             if (bg == 0) {
                 return false;
             }
-            if (bg->slot.state == SG_RESOURCESTATE_VALID) {
-                _sg_wgpu_bindgroups_cache_set(key.hash, bg->slot.id);
-            } else {
+            if (bg->slot.state != SG_RESOURCESTATE_VALID) {
                 _sg_wgpu_discard_bindgroup(bg);
                 return false;
             }
         }
-        SOKOL_ASSERT(bg && (bg->slot.state == SG_RESOURCESTATE_VALID));
+        _sg_wgpu_bindgroups_cache_promote(ways, way, bg->slot.id);
         _sg_wgpu_set_bindgroup(_SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, bg);
     } else {
         // bindgroups cache disabled, create and destroy bindgroup on the fly (expensive!)
@@ -20256,6 +20294,7 @@ _SOKOL_PRIVATE void _sg_wgpu_discard_backend(void) {
 
 _SOKOL_PRIVATE void _sg_wgpu_reset_state_cache(void) {
     _sg_wgpu_bindings_cache_clear();
+    _sg.wgpu.render_state_cache.is_valid = false;
 }
 
 #if defined(__EMSCRIPTEN__)
@@ -20720,9 +20759,10 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_shader(_sg_shader_t* shd, const
         bgl_entry->visibility = _sg_wgpu_shader_stage(shd->cmn.uniform_blocks[i].stage);
         bgl_entry->buffer.type = WGPUBufferBindingType_Uniform;
         bgl_entry->buffer.hasDynamicOffset = true;
+        bgl_entry->buffer.minBindingSize = shd->cmn.uniform_blocks[i].size;
         bg_entry->binding = bgl_entry->binding;
         bg_entry->buffer = _sg.wgpu.uniform.buf;
-        bg_entry->size = _SG_WGPU_MAX_UNIFORM_UPDATE_SIZE;
+        bg_entry->size = shd->cmn.uniform_blocks[i].size;
         dynoffset_map[bgl_index].sokol_slot = (uint8_t)i;
         dynoffset_map[bgl_index].wgpu_slot = (uint8_t)bgl_entry->binding;
         bgl_index += 1;
@@ -20803,11 +20843,19 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_shader(_sg_shader_t* shd, const
         _SG_ERROR(WGPU_SHADER_CREATE_BINDGROUP_LAYOUT_FAILED);
         return SG_RESOURCESTATE_FAILED;
     }
+    if (bgl_index == 0) {
+        _sg_clear(&bg_desc, sizeof(bg_desc));
+        bg_desc.layout = shd->wgpu.bgl_view_smp;
+        shd->wgpu.bg_view_smp_empty = wgpuDeviceCreateBindGroup(_sg.wgpu.dev, &bg_desc);
+        _sg_stats_inc(wgpu.bindings.num_create_bindgroup);
+        SOKOL_ASSERT(shd->wgpu.bg_view_smp_empty);
+    }
     return SG_RESOURCESTATE_VALID;
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_discard_shader(_sg_shader_t* shd) {
     SOKOL_ASSERT(shd);
+    _sg_wgpu_bindgroups_cache_invalidate(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_SHADER, &shd->slot);
     _sg_wgpu_discard_shader_func(&shd->wgpu.vertex_func);
     _sg_wgpu_discard_shader_func(&shd->wgpu.fragment_func);
     _sg_wgpu_discard_shader_func(&shd->wgpu.compute_func);
@@ -20818,6 +20866,10 @@ _SOKOL_PRIVATE void _sg_wgpu_discard_shader(_sg_shader_t* shd) {
     if (shd->wgpu.bg_ub) {
         wgpuBindGroupRelease(shd->wgpu.bg_ub);
         shd->wgpu.bg_ub = 0;
+    }
+    if (shd->wgpu.bg_view_smp_empty) {
+        wgpuBindGroupRelease(shd->wgpu.bg_view_smp_empty);
+        shd->wgpu.bg_view_smp_empty = 0;
     }
     if (shd->wgpu.bgl_view_smp) {
         wgpuBindGroupLayoutRelease(shd->wgpu.bgl_view_smp);
@@ -20968,7 +21020,6 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_pipeline(_sg_pipeline_t* pip, c
 
 _SOKOL_PRIVATE void _sg_wgpu_discard_pipeline(_sg_pipeline_t* pip) {
     SOKOL_ASSERT(pip);
-    _sg_wgpu_bindgroups_cache_invalidate(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_PIPELINE, &pip->slot);
     if (pip->wgpu.rpip) {
         wgpuRenderPipelineRelease(pip->wgpu.rpip);
         pip->wgpu.rpip = 0;
@@ -21068,10 +21119,7 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_compute_pass(const sg_pass* pass) {
     wgpu_pass_desc.label = _sg_wgpu_stringview(pass->label);
     _sg.wgpu.cpass_enc = wgpuCommandEncoderBeginComputePass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
     SOKOL_ASSERT(_sg.wgpu.cpass_enc);
-    // clear initial bindings
-    wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, _SG_WGPU_UB_BINDGROUP_INDEX, 0, 0, 0);
-    wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, 0, 0, 0);
-    _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
+    // Fresh encoders have no bindings. Pipeline application supplies non-null empty groups.
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_begin_render_pass(const sg_pass* pass, const _sg_attachments_ptrs_t* atts) {
@@ -21123,9 +21171,7 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_render_pass(const sg_pass* pass, const _sg_at
     _sg.wgpu.rpass_enc = wgpuCommandEncoderBeginRenderPass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
     SOKOL_ASSERT(_sg.wgpu.rpass_enc);
 
-    wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, _SG_WGPU_UB_BINDGROUP_INDEX, 0, 0, 0);
-    wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, 0, 0, 0);
-    _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
+    // Fresh encoders have no bindings. Pipeline application supplies non-null empty groups.
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_acquire_command_encoder(void) {
@@ -21143,7 +21189,7 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_pass(const sg_pass* pass, const _sg_attachmen
     SOKOL_ASSERT(0 == _sg.wgpu.cpass_enc);
 
     _sg_wgpu_acquire_command_encoder();
-    _sg_wgpu_bindings_cache_clear();
+    _sg_wgpu_reset_state_cache();
     if (pass->compute) {
         _sg_wgpu_begin_compute_pass(pass);
     } else {
@@ -21206,18 +21252,44 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_scissor_rect(int x, int y, int w, int h, bool
 _SOKOL_PRIVATE void _sg_wgpu_apply_pipeline(_sg_pipeline_t* pip) {
     SOKOL_ASSERT(pip);
     _sg_wgpu_uniform_system_on_apply_pipeline();
+    const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
     if (pip->cmn.is_compute) {
         SOKOL_ASSERT(_sg.cur_pass.is_compute);
         SOKOL_ASSERT(pip->wgpu.cpip);
         SOKOL_ASSERT(_sg.wgpu.cpass_enc);
         wgpuComputePassEncoderSetPipeline(_sg.wgpu.cpass_enc, pip->wgpu.cpip);
+        if (shd->wgpu.bg_view_smp_empty) {
+            wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, shd->wgpu.bg_view_smp_empty, 0, 0);
+            _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
+            // This raw bind replaces the group tracked by the redundancy cache.
+            _sg_wgpu_bindings_cache_bg_update(0);
+        }
     } else {
         SOKOL_ASSERT(!_sg.cur_pass.is_compute);
         SOKOL_ASSERT(pip->wgpu.rpip);
         SOKOL_ASSERT(_sg.wgpu.rpass_enc);
         wgpuRenderPassEncoderSetPipeline(_sg.wgpu.rpass_enc, pip->wgpu.rpip);
-        wgpuRenderPassEncoderSetBlendConstant(_sg.wgpu.rpass_enc, &pip->wgpu.blend_color);
-        wgpuRenderPassEncoderSetStencilReference(_sg.wgpu.rpass_enc, pip->cmn.stencil.ref);
+        if (shd->wgpu.bg_view_smp_empty) {
+            wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, shd->wgpu.bg_view_smp_empty, 0, 0);
+            _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
+            // This raw bind replaces the group tracked by the redundancy cache.
+            _sg_wgpu_bindings_cache_bg_update(0);
+        }
+        const WGPUColor* color = &pip->wgpu.blend_color;
+        const WGPUColor* cached = &_sg.wgpu.render_state_cache.blend_color;
+        if (!_sg.wgpu.render_state_cache.is_valid ||
+            color->r != cached->r || color->g != cached->g || color->b != cached->b || color->a != cached->a)
+        {
+            wgpuRenderPassEncoderSetBlendConstant(_sg.wgpu.rpass_enc, color);
+            _sg_stats_inc(wgpu.num_set_blend_constant);
+            _sg.wgpu.render_state_cache.blend_color = *color;
+        }
+        if (!_sg.wgpu.render_state_cache.is_valid || pip->cmn.stencil.ref != _sg.wgpu.render_state_cache.stencil_ref) {
+            wgpuRenderPassEncoderSetStencilReference(_sg.wgpu.rpass_enc, pip->cmn.stencil.ref);
+            _sg_stats_inc(wgpu.num_set_stencil_reference);
+            _sg.wgpu.render_state_cache.stencil_ref = pip->cmn.stencil.ref;
+        }
+        _sg.wgpu.render_state_cache.is_valid = true;
     }
 }
 
@@ -27087,10 +27159,17 @@ _SOKOL_PRIVATE bool _sg_validate_apply_bindings(const sg_bindings* bindings) {
     #endif
 }
 
-_SOKOL_PRIVATE bool _sg_validate_apply_uniforms(int ub_slot, const sg_range* data) {
+#if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+_SOKOL_PRIVATE _sg_uniform_cache_entry_t* _sg_uniform_cache_entry(uint64_t data_id) {
+    return &_sg.uniform_cache[data_id & (_SG_UNIFORM_CACHE_SIZE - 1)];
+}
+#endif
+
+_SOKOL_PRIVATE bool _sg_validate_apply_uniforms(int ub_slot, const sg_range* data, uint64_t data_id) {
     #if !defined(SOKOL_DEBUG)
         _SOKOL_UNUSED(ub_slot);
         _SOKOL_UNUSED(data);
+        _SOKOL_UNUSED(data_id);
         return true;
     #else
         if (_sg.desc.disable_validation) {
@@ -27118,6 +27197,15 @@ _SOKOL_PRIVATE bool _sg_validate_apply_uniforms(int ub_slot, const sg_range* dat
                 _SG_VALIDATE(data->size == shd->cmn.uniform_blocks[ub_slot].size, VALIDATE_AU_SIZE);
             }
         }
+        #if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+        if (data_id) {
+            const _sg_uniform_cache_entry_t* e = _sg_uniform_cache_entry(data_id);
+            const bool is_recorded = e->frame == _sg.uniform_cache_frame && e->data_id == data_id;
+            _SG_VALIDATE(!is_recorded || e->size == data->size, VALIDATE_AU_CACHED_SIZE);
+        }
+        #else
+        _SOKOL_UNUSED(data_id);
+        #endif
         return _sg_validate_end();
     #endif
 }
@@ -28464,6 +28552,8 @@ _SOKOL_PRIVATE void _sg_override_portable_limits(void) {
 // ██       ██████  ██████  ███████ ██  ██████
 //
 // >>public
+static uint64_t _sg_uniform_data_id;
+
 SOKOL_API_IMPL void sg_setup(const sg_desc* desc) {
     SOKOL_ASSERT(!_sg.valid);
     SOKOL_ASSERT(desc);
@@ -28474,6 +28564,7 @@ SOKOL_API_IMPL void sg_setup(const sg_desc* desc) {
     _sg_setup_pools(&_sg.pools, &_sg.desc);
     _sg_setup_commit_listeners(&_sg.desc);
     _sg.frame_index = 1;
+    _sg.uniform_cache_frame = 1;
     _sg.stats_enabled = true;
     _sg_setup_backend(&_sg.desc);
     _sg_override_portable_limits();
@@ -29386,24 +29477,70 @@ SOKOL_API_IMPL void sg_apply_bindings(const sg_bindings* bindings) {
     }
 }
 
-SOKOL_API_IMPL void sg_apply_uniforms(int ub_slot, const sg_range* data) {
+_SOKOL_PRIVATE void _sg_apply_uniforms_checked(int ub_slot, const sg_range* data, uint64_t data_id) {
     SOKOL_ASSERT(_sg.valid);
     SOKOL_ASSERT((ub_slot >= 0) && (ub_slot < SG_MAX_UNIFORMBLOCK_BINDSLOTS));
     SOKOL_ASSERT(data && data->ptr && (data->size > 0));
     _sg_stats_inc(num_apply_uniforms);
+    if (data_id) { _sg_stats_inc(num_apply_uniforms_cached); }
     _sg_stats_add(size_apply_uniforms, (uint32_t)data->size);
     _SG_TRACE_ARGS(apply_uniforms, ub_slot, data);
     if (!_sg.cur_pass.valid) {
         return;
     }
-    if (!_sg_validate_apply_uniforms(ub_slot, data)) {
+    if (!_sg_validate_apply_uniforms(ub_slot, data, data_id)) {
         _sg.next_draw_valid = false;
         return;
     }
     if (!_sg.next_draw_valid) {
         return;
     }
+    #if defined(SOKOL_METAL) || defined(SOKOL_WGPU)
+    if (data_id) {
+        const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+        const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+        _sg_uniform_cache_entry_t* e = _sg_uniform_cache_entry(data_id);
+        #if defined(SOKOL_METAL)
+        const uint32_t offset = (uint32_t)_sg.mtl.cur_ub_offset;
+        #else
+        const uint32_t offset = _sg.wgpu.uniform.offset;
+        #endif
+        // The ring is append-only within a commit, so the range still holds this ID's bytes.
+        if (e->frame == _sg.uniform_cache_frame && e->data_id == data_id && e->size == data->size
+            && shd->cmn.uniform_blocks[ub_slot].size == data->size && (uint64_t)e->offset + data->size <= offset) {
+            #if defined(SOKOL_METAL)
+            _sg_mtl_bind_uniforms(ub_slot, e->offset);
+            #else
+            _sg.wgpu.uniform.bind_offsets[ub_slot] = e->offset;
+            _sg.wgpu.uniform.dirty = true;
+            #endif
+            _sg_stats_inc(num_reuse_uniforms);
+            _sg_stats_add(size_reuse_uniforms, (uint32_t)data->size);
+            return;
+        }
+        _sg_apply_uniforms(ub_slot, data);
+        e->frame = _sg.uniform_cache_frame;
+        e->data_id = data_id;
+        e->offset = offset;
+        e->size = (uint32_t)data->size;
+        return;
+    }
+    #endif
     _sg_apply_uniforms(ub_slot, data);
+}
+
+SOKOL_API_IMPL void sg_apply_uniforms(int ub_slot, const sg_range* data) {
+    _sg_apply_uniforms_checked(ub_slot, data, 0);
+}
+
+SOKOL_API_IMPL uint64_t sg_alloc_uniform_data_id(void) {
+    SOKOL_ASSERT(_sg.valid && _sg_uniform_data_id != UINT64_MAX);
+    return ++_sg_uniform_data_id;
+}
+
+SOKOL_API_IMPL void sg_apply_uniforms_cached(int ub_slot, const sg_range* data, uint64_t data_id) {
+    SOKOL_ASSERT(data_id > 0 && data_id <= _sg_uniform_data_id);
+    _sg_apply_uniforms_checked(ub_slot, data, data_id);
 }
 
 _SOKOL_PRIVATE bool _sg_check_skip_draw(int num_elements, int num_instances) {
@@ -29522,6 +29659,7 @@ SOKOL_API_IMPL void sg_commit(void) {
     SOKOL_ASSERT(!_sg.cur_pass.valid);
     SOKOL_ASSERT(!_sg.cur_pass.in_pass);
     _sg_commit();
+    _sg.uniform_cache_frame++;
     _sg_update_stats();
     _sg_notify_commit_listeners();
     _SG_TRACE_NOARGS(commit);

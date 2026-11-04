@@ -71,14 +71,14 @@ static void lifetimes(void) {
     group->slot.state = SG_RESOURCESTATE_VALID;
     const _sg_slot_t* slot = &_sg_lookup_view(view.id)->slot;
     group->key.items[0] = _sg_wgpu_bindgroups_cache_item(_SG_WGPU_BINDGROUPSCACHEITEMTYPE_VIEW, 9, slot->id, slot->uninit_count);
-    _sg_wgpu_bindgroups_cache_set(5, id.id);
+    _sg_wgpu_bindgroups_cache_promote(_sg_wgpu_bindgroups_cache_ways(5), 0, id.id);
     _sg.wgpu.bindings_cache.bg = id;
     _sg_wgpu_bindings_cache_vb_update(0, _sg_lookup_buffer(src.id), 4);
     _sg_wgpu_bindings_cache_ib_update(_sg_lookup_buffer(src.id), 0, WGPUIndexFormat_Uint16);
     copy(src, dst);
     sg_destroy_buffer(src);
     CHECK(!destroyed(native) && wgpu_mock_ref_count(native) > 0);
-    CHECK(!_sg.wgpu.bindgroups_cache.items[5].id && !_sg.wgpu.bindings_cache.bg.id);
+    CHECK(!_sg.wgpu.bindgroups_cache.items[0].id && !_sg.wgpu.bindings_cache.bg.id);
     CHECK(!_sg.wgpu.bindings_cache.vbs[0].buffer.id && !_sg.wgpu.bindings_cache.ib.buffer.id);
     CHECK(!_sg_lookup_view(view.id)->wgpu.next && !_sg_lookup_view(later.id)->wgpu.prev);
     sg_buffer reused = buffer();
