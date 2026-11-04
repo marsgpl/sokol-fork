@@ -83,10 +83,12 @@
     _WGPUM_XMACRO(wgpuDeviceCreateCommandEncoder) \
     _WGPUM_XMACRO(wgpuBufferAddRef) \
     _WGPUM_XMACRO(wgpuBufferRelease) \
+    _WGPUM_XMACRO(wgpuBufferDestroy) \
     _WGPUM_XMACRO(wgpuBufferGetMappedRange) \
     _WGPUM_XMACRO(wgpuBufferUnmap) \
     _WGPUM_XMACRO(wgpuTextureAddRef) \
     _WGPUM_XMACRO(wgpuTextureRelease) \
+    _WGPUM_XMACRO(wgpuTextureDestroy) \
     _WGPUM_XMACRO(wgpuTextureCreateView) \
     _WGPUM_XMACRO(wgpuTextureViewRelease) \
     _WGPUM_XMACRO(wgpuSamplerAddRef) \
@@ -206,6 +208,7 @@ typedef struct {
 // per-object state snapshots
 typedef struct {
     uint64_t size;
+    bool destroyed;
     WGPUBufferUsage usage;
     bool mapped_at_creation;
     bool mapped;                    // currently mapped
@@ -219,6 +222,7 @@ typedef struct {
 
 typedef struct {
     WGPUTextureDimension dimension;
+    bool destroyed;
     uint32_t width, height, depth_or_layers;
     WGPUTextureFormat format;
     uint32_t mip_level_count;

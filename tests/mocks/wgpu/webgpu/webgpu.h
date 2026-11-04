@@ -807,10 +807,12 @@ WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice device, const WGPUC
 
 void wgpuBufferAddRef(WGPUBuffer buffer);
 void wgpuBufferRelease(WGPUBuffer buffer);
+void wgpuBufferDestroy(WGPUBuffer buffer);
 void* wgpuBufferGetMappedRange(WGPUBuffer buffer, size_t offset, size_t size);
 void wgpuBufferUnmap(WGPUBuffer buffer);
 void wgpuTextureAddRef(WGPUTexture texture);
 void wgpuTextureRelease(WGPUTexture texture);
+void wgpuTextureDestroy(WGPUTexture texture);
 WGPUTextureView wgpuTextureCreateView(WGPUTexture texture, const WGPUTextureViewDescriptor* desc);
 void wgpuTextureViewRelease(WGPUTextureView view);
 void wgpuSamplerAddRef(WGPUSampler sampler);

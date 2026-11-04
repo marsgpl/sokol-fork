@@ -2694,6 +2694,21 @@ WM_DEFINE_RELEASE(wgpuQueueRelease, WGPUQueue, WGPU_MOCK_OBJ_QUEUE)
 WM_DEFINE_RELEASE(wgpuCommandEncoderRelease, WGPUCommandEncoder, WGPU_MOCK_OBJ_COMMAND_ENCODER)
 WM_DEFINE_RELEASE(wgpuCommandBufferRelease, WGPUCommandBuffer, WGPU_MOCK_OBJ_COMMAND_BUFFER)
 WM_DEFINE_RELEASE(wgpuComputePassEncoderRelease, WGPUComputePassEncoder, WGPU_MOCK_OBJ_COMPUTE_PASS_ENCODER)
+
+void wgpuBufferDestroy(WGPUBuffer buffer) {
+    begin_call(WGPU_MOCK_FUNC_wgpuBufferDestroy, buffer);
+    obj_t* b = lookup(buffer, WGPU_MOCK_OBJ_BUFFER, "wgpuBufferDestroy");
+    if (b) {
+        b->u.buffer.info.destroyed = true;
+        b->u.buffer.info.mapped = false;
+    }
+}
+
+void wgpuTextureDestroy(WGPUTexture texture) {
+    begin_call(WGPU_MOCK_FUNC_wgpuTextureDestroy, texture);
+    obj_t* t = lookup(texture, WGPU_MOCK_OBJ_TEXTURE, "wgpuTextureDestroy");
+    if (t) { t->u.texture.info.destroyed = true; }
+}
 WM_DEFINE_RELEASE(wgpuRenderPassEncoderRelease, WGPURenderPassEncoder, WGPU_MOCK_OBJ_RENDER_PASS_ENCODER)
 
 WGPUBool wgpuDeviceHasFeature(WGPUDevice device, WGPUFeatureName feature) {
