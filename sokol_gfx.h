@@ -7993,6 +7993,9 @@ typedef struct {
     id<MTLRenderCommandEncoder> render_cmd_encoder;
     id<MTLComputeCommandEncoder> compute_cmd_encoder;
     id<MTLBlitCommandEncoder> blit_cmd_encoder;
+    id<MTLCommandBuffer> opt_cmd_buffer;
+    id<MTLBlitCommandEncoder> opt_blit_encoder;
+    id<MTLCommandBuffer> opt_last_submitted;
     id<CAMetalDrawable> cur_drawable;
     id<CAMetalDrawable> deferred_drawable;
     id<MTLBuffer> uniform_buffers[SG_NUM_INFLIGHT_FRAMES];
@@ -17550,9 +17553,37 @@ _SOKOL_PRIVATE void _sg_mtl_setup_backend(const sg_desc* desc) {
     _sg_mtl_init_caps();
 }
 
+// Sulrim: retain textures independently of the frame's unretained command buffer.
+_SOKOL_PRIVATE void _sg_mtl_optimize_texture(__unsafe_unretained id<MTLTexture> tex) {
+    if (nil == _sg.mtl.opt_cmd_buffer) {
+        _sg.mtl.opt_cmd_buffer = [_sg.mtl.cmd_queue commandBuffer];
+        SOKOL_ASSERT(_sg.mtl.opt_cmd_buffer);
+        _SG_OBJC_RETAIN(_sg.mtl.opt_cmd_buffer);
+        _sg.mtl.opt_blit_encoder = [_sg.mtl.opt_cmd_buffer blitCommandEncoder];
+        SOKOL_ASSERT(_sg.mtl.opt_blit_encoder);
+        _SG_OBJC_RETAIN(_sg.mtl.opt_blit_encoder);
+    }
+    [_sg.mtl.opt_blit_encoder optimizeContentsForGPUAccess:tex];
+}
+
+_SOKOL_PRIVATE void _sg_mtl_flush_optimize(void) {
+    if (nil != _sg.mtl.opt_cmd_buffer) {
+        [_sg.mtl.opt_blit_encoder endEncoding];
+        [_sg.mtl.opt_cmd_buffer commit];
+        _SG_OBJC_RELEASE(_sg.mtl.opt_blit_encoder);
+        _SG_OBJC_RELEASE(_sg.mtl.opt_last_submitted);
+        _sg.mtl.opt_last_submitted = _sg.mtl.opt_cmd_buffer;
+        _sg.mtl.opt_cmd_buffer = nil;
+    }
+}
+
 _SOKOL_PRIVATE void _sg_mtl_discard_backend(void) {
     SOKOL_ASSERT(_sg.mtl.valid);
     _sg_mtl_async_discard_all();
+    _sg_mtl_flush_optimize();
+    // Normal frame semaphores can finish before the optimization queued behind them.
+    [_sg.mtl.opt_last_submitted waitUntilCompleted];
+    _SG_OBJC_RELEASE(_sg.mtl.opt_last_submitted);
     // wait for the last frame to finish
     for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) {
         dispatch_semaphore_wait(_sg.mtl.sem, DISPATCH_TIME_FOREVER);
@@ -17819,6 +17850,13 @@ _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_image(_sg_image_t* img, const sg
             }
             if (desc->data.ptr) {
                 _sg_mtl_copy_image_data(img, mtl_tex, &desc->data);
+                const sg_image_usage* usg = &img->cmn.usage;
+                if ((mtl_tex.storageMode == MTLStorageModeShared) &&
+                    !usg->write_unsealed && !usg->write_transient && !usg->copy_dst &&
+                    !usg->storage_image && !usg->color_attachment && !usg->resolve_attachment &&
+                    !usg->depth_stencil_attachment && !_sg_is_compressed_pixel_format(img->cmn.pixel_format)) {
+                    _sg_mtl_optimize_texture(mtl_tex);
+                }
             }
         }
         #if defined(SOKOL_DEBUG)
@@ -18693,6 +18731,9 @@ _SOKOL_PRIVATE void _sg_mtl_commit(void) {
         }
         [_sg.mtl.cmd_buffer commit];
     }
+
+    // The current frame was explicitly enqueued; submit optimization after it.
+    _sg_mtl_flush_optimize();
 
     // garbage-collect resources pending for release
     _sg_mtl_garbage_collect(_sg.frame_index);
