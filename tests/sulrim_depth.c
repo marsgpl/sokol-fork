@@ -9,6 +9,7 @@
 extern WGPUDevice emscripten_webgpu_get_device(void);
 #define EXPORT EMSCRIPTEN_KEEPALIVE
 #else
+#include <unistd.h>
 #define EXPORT
 #endif
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%d: %s\n", __LINE__, #x); abort(); } } while (0)
@@ -31,14 +32,14 @@ static void logger(const char* tag, uint32_t level, uint32_t item, const char* m
 #include "sulrim_pass_local_depth.h"
 #if defined(SOKOL_METAL)
 static const char* source = "#include <metal_stdlib>\nusing namespace metal;\n"
-    "struct V { float4 p [[position]]; float4 color; };"
+    "struct V { float4 p [[position, invariant]]; float4 color; };"
     "vertex V vs(uint i [[vertex_id]]) { uint v=i%3; V o; bool far=i>=3;"
     "o.p=float4(v==1?3.0:-1.0,v==2?3.0:-1.0,far?0.75:0.25,1);"
     "o.color=far?float4(0,1,0,1):float4(1,0,0,1);return o;}"
     "fragment float4 fs(V v [[stage_in]]) {return v.color;}"
     "fragment void fade(V v [[stage_in]]) {if((uint(v.p.x)&1u)==0u) discard_fragment();}";
 #else
-static const char* source = "struct V { @builtin(position) p:vec4f, @location(0) color:vec4f };"
+static const char* source = "struct V { @builtin(position) @invariant p:vec4f, @location(0) color:vec4f };"
     "@vertex fn vs(@builtin(vertex_index) i:u32)->V { let v=i%3; var o:V; let far=i>=3;"
     "o.p=vec4f(select(-1.0,3.0,v==1),select(-1.0,3.0,v==2),select(0.25,0.75,far),1);"
     "o.color=select(vec4f(1,0,0,1),vec4f(0,1,0,1),far);return o;}"
@@ -85,7 +86,7 @@ EXPORT void probe_init(void) {
 }
 
 EXPORT void probe_render(int mode, int w, int h) {
-    CHECK(mode >= 0 && mode < 5 && !color.id);
+    CHECK(mode >= 0 && mode < 6 && !color.id);
     width = w; height = h;
     sg_image depth = sg_make_image(&(sg_image_desc){.width = width, .height = height, .sample_count = 1,
         .label = "sulrim-depth",
@@ -108,14 +109,14 @@ EXPORT void probe_render(int mode, int w, int h) {
     CHECK(sg_query_image_state(color) == SG_RESOURCESTATE_VALID);
     CHECK(sg_query_view_state(cv) == SG_RESOURCESTATE_VALID && sg_query_view_state(dv) == SG_RESOURCESTATE_VALID);
     for (int frame = 0; frame < SG_NUM_INFLIGHT_FRAMES + 2; frame++) {
-        if (mode == 2 || mode == 3) {
+        if (mode == 2 || mode == 3 || mode == 5) {
             sg_begin_pass(&(sg_pass){.attachments.depth_stencil = dv,
                 .action.depth = {.load_action = SG_LOADACTION_CLEAR, .clear_value = 1, .store_action = SG_STOREACTION_STORE}});
-            sg_apply_pipeline(depth_pipelines[mode - 2]); sg_draw(0, 3, 1); sg_end_pass();
+            sg_apply_pipeline(depth_pipelines[mode == 3]); sg_draw(0, 3, 1); sg_end_pass();
             sg_begin_pass(&(sg_pass){.attachments = {.colors[0] = cv, .depth_stencil = dv},
                 .action = {.colors[0] = {.load_action = SG_LOADACTION_CLEAR, .clear_value = {0,0,0,1}},
                     .depth.load_action = SG_LOADACTION_LOAD}});
-            sg_apply_pipeline(pipelines[0]); sg_draw(3, 3, 1); sg_end_pass();
+            sg_apply_pipeline(pipelines[0]); sg_draw(mode == 5 ? 0 : 3, 3, 1); sg_end_pass();
         } else {
             for (int slice = 0; slice < 4; slice++) {
                 sg_begin_pass(&(sg_pass){.attachments = {.colors[0] = cv, .depth_stencil = dv}, .action = {
@@ -152,21 +153,49 @@ static void check_render(int mode) {
     const uint8_t* pixels = read.contents;
     for (int y = 0; y < height; y++) for (int x = 0; x < width; x++) {
         const uint8_t* p = pixels + y * pitch + x * 4;
-        bool green = mode == 2 || mode == 3 ? mode == 3 && !(x & 1) : (x / (width / 4)) & 1;
-        CHECK(p[0] == ((mode < 2 || mode == 4) && !green ? 255 : 0) && p[1] == (green ? 255 : 0) && p[2] == 0 && p[3] == 255);
+        bool green = mode == 5 ? false : mode == 2 || mode == 3 ? mode == 3 && !(x & 1) : (x / (width / 4)) & 1;
+        CHECK(p[0] == ((mode < 2 || mode >= 4) && !green ? 255 : 0) && p[1] == (green ? 255 : 0) && p[2] == 0 && p[3] == 255);
         pixels_checked++;
     }
     _SG_OBJC_RELEASE(read);
 }
+static void check_invariance(void) {
+    CHECK(_sg.mtl.compile_options.preserveInvariance);
+    const sg_pipeline saved_depth = depth_pipelines[0], saved_color = pipelines[0];
+    for (int async = 0; async < 2; async++) {
+        sg_shader_desc desc = {.vertex_func = {.source = source, .entry = "vs"}, .async_compile = async};
+        sg_shader pre = sg_make_shader(&desc);
+        desc.fragment_func = (sg_shader_function){.source = source, .entry = "fs"};
+        sg_shader shaded = sg_make_shader(&desc);
+        depth_pipelines[0] = sg_make_pipeline(&(sg_pipeline_desc){.shader = pre, .async_compile = async,
+            .colors[0].pixel_format = SG_PIXELFORMAT_NONE,
+            .depth = {.pixel_format = SG_PIXELFORMAT_DEPTH, .compare = SG_COMPAREFUNC_LESS, .write_enabled = true}});
+        pipelines[0] = sg_make_pipeline(&(sg_pipeline_desc){.shader = shaded, .async_compile = async,
+            .depth = {.pixel_format = SG_PIXELFORMAT_DEPTH, .compare = SG_COMPAREFUNC_EQUAL}});
+        if (async) CHECK(sg_query_pipeline_state(depth_pipelines[0]) == SG_RESOURCESTATE_PENDING);
+        int frames = 0;
+        while (sg_query_pipeline_state(depth_pipelines[0]) == SG_RESOURCESTATE_PENDING || sg_query_pipeline_state(pipelines[0]) == SG_RESOURCESTATE_PENDING) {
+            CHECK(++frames < 4000); sg_commit(); usleep(1000);
+        }
+        CHECK(sg_query_pipeline_state(depth_pipelines[0]) == SG_RESOURCESTATE_VALID && sg_query_pipeline_state(pipelines[0]) == SG_RESOURCESTATE_VALID);
+        probe_render(5, 128, 64); check_render(5); probe_release();
+        sg_destroy_pipeline(depth_pipelines[0]); sg_destroy_pipeline(pipelines[0]);
+        sg_destroy_shader(pre); sg_destroy_shader(shaded);
+    }
+    depth_pipelines[0] = saved_depth; pipelines[0] = saved_color;
+}
 int main(void) {
     @autoreleasepool {
         probe_init();
+#if !defined(SULRIM_INVARIANCE_ONLY)
         const int sizes[][2] = {{16,4},{32,8},{128,64},{64,32}};
         for (int i = 0; i < 4; i++) for (int mode = 0; mode < 5; mode++) {
             probe_render(mode, sizes[i][0], sizes[i][1]); check_render(mode); probe_release();
         }
+#endif
+        check_invariance();
         probe_shutdown();
-        printf("Metal depth: %llu exact pixels, occlusion/clear/reuse/resize PASS\n", (unsigned long long)pixels_checked);
+        printf("Metal depth: %llu exact pixels, sync/async invariant EQUAL passes PASS\n", (unsigned long long)pixels_checked);
     }
 }
 #endif

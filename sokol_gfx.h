@@ -2699,6 +2699,10 @@ typedef struct sg_limits {
 
     The special INVALID state is returned in sg_query_xxx_state() if no
     resource object exists for the provided resource id.
+
+    Sulrim: shaders/pipelines made with .async_compile stay PENDING until a
+    later sg_commit() publishes VALID or FAILED. Applying a PENDING pipeline
+    silently skips the following bindings, uniforms, draws and dispatches.
 */
 typedef enum sg_resource_state {
     SG_RESOURCESTATE_INITIAL,
@@ -2707,6 +2711,7 @@ typedef enum sg_resource_state {
     SG_RESOURCESTATE_VALID,
     SG_RESOURCESTATE_FAILED,
     SG_RESOURCESTATE_INVALID,
+    SG_RESOURCESTATE_PENDING,  // Sulrim: async compilation, published by sg_commit
     _SG_RESOURCESTATE_FORCE_U32 = 0x7FFFFFFF
 } sg_resource_state;
 
@@ -4534,6 +4539,7 @@ typedef struct sg_shader_desc {
     sg_shader_sampler samplers[SG_MAX_SAMPLER_BINDSLOTS];
     sg_shader_texture_sampler_pair texture_sampler_pairs[SG_MAX_TEXTURE_SAMPLER_PAIRS];
     sg_mtl_shader_threads_per_threadgroup mtl_threads_per_threadgroup;
+    bool async_compile;     // Sulrim: Metal source compiles off-thread (PENDING until sg_commit publishes)
     const char* label;
     uint32_t _end_canary;
 } sg_shader_desc;
@@ -4695,6 +4701,7 @@ typedef struct sg_pipeline_desc {
     int sample_count;
     sg_color blend_color;
     bool alpha_to_coverage_enabled;
+    bool async_compile;     // Sulrim: Metal/WebGPU compile off-thread (PENDING until sg_commit publishes)
     const char* label;
     uint32_t _end_canary;
 } sg_pipeline_desc;
@@ -7908,6 +7915,20 @@ typedef struct {
     _sg_sref_t cur_cssmps[_SG_MTL_MAX_STAGE_SAMPLER_BINDINGS];
 } _sg_mtl_cache_t;
 
+// Sulrim: one async shader/pipeline compile; completion handlers write results, then drop `pending`
+typedef struct _sg_mtl_async_s {
+    struct _sg_mtl_async_s* next;
+    _sg_sref_t sref;        // target slot, generation-checked at publish
+    bool is_pipeline;
+    bool is_issued;         // pipeline: false while its shader is PENDING
+    uint8_t func_mask;      // shader: bit i set when func i (vs, fs, cs) compiles async
+    int pending;            // completion handlers in flight (atomic)
+    void* desc;             // retained MTL*PipelineDescriptor
+    void* obj[3];           // retained libraries (vs, fs, cs) or pipeline state (0)
+    void* func[3];          // retained shader functions
+    void* err[3];           // retained NSErrors
+} _sg_mtl_async_t;
+
 typedef struct {
     bool valid;
     bool use_shared_storage_mode;
@@ -7926,6 +7947,9 @@ typedef struct {
     id<MTLBlitCommandEncoder> blit_cmd_encoder;
     id<CAMetalDrawable> cur_drawable;
     id<MTLBuffer> uniform_buffers[SG_NUM_INFLIGHT_FRAMES];
+    _sg_mtl_async_t* async;
+    dispatch_group_t async_group;
+    MTLCompileOptions* compile_options;
 } _sg_mtl_backend_t;
 
 #elif defined(SOKOL_WGPU)
@@ -8107,6 +8131,17 @@ typedef struct {
     sg_wgpu_memory_stats stats;
 } _sg_wgpu_retirement_t;
 
+// Sulrim: one async pipeline compile, filled by its callback, published by sg_commit
+typedef struct _sg_wgpu_async_s {
+    struct _sg_wgpu_async_s* next;
+    _sg_sref_t sref;            // target slot, generation-checked at publish
+    uint32_t ticket;            // callback userdata2, unique across sg_setup sessions
+    bool is_done;
+    WGPURenderPipeline rpip;
+    WGPUComputePipeline cpip;
+    char* msg;                  // copied error message
+} _sg_wgpu_async_t;
+
 // the WGPU backend state
 typedef struct {
     bool valid;
@@ -8126,6 +8161,7 @@ typedef struct {
     _sg_wgpu_bindgroups_cache_t bindgroups_cache;
     _sg_wgpu_bindgroups_pool_t bindgroups_pool;
     _sg_wgpu_retirement_t retirement;
+    _sg_wgpu_async_t* async;    // Sulrim: in-flight pipeline compiles
 } _sg_wgpu_backend_t;
 
 #elif defined(SOKOL_VULKAN)
@@ -8449,6 +8485,7 @@ typedef struct {
     } cur_pass;
     _sg_pipeline_ref_t cur_pip;
     bool next_draw_valid;
+    bool cur_pip_pending;  // Skip until the next pipeline application.
     bool use_indexed_draw;
     bool use_instanced_draw;
     struct {
@@ -9203,6 +9240,10 @@ _SOKOL_PRIVATE _sg_recti_t _sg_clipi(int x, int y, int w, int h, int clip_width,
 
 _SOKOL_PRIVATE bool _sg_resource_state_valid_failed(sg_resource_state s) {
     return (s == SG_RESOURCESTATE_VALID) || (s == SG_RESOURCESTATE_FAILED);
+}
+
+_SOKOL_PRIVATE bool _sg_resource_state_valid_failed_pending(sg_resource_state state) {
+    return _sg_resource_state_valid_failed(state) || (state == SG_RESOURCESTATE_PENDING);
 }
 
 _SOKOL_PRIVATE bool _sg_resource_state_valid_failed_unsealed(sg_resource_state s) {
@@ -16485,9 +16526,15 @@ _SOKOL_PRIVATE void _sg_d3d11_copy_image_to_image(_sg_image_t* src_img, _sg_imag
 #if __has_feature(objc_arc)
 #define _SG_OBJC_RETAIN(obj) { }
 #define _SG_OBJC_RELEASE(obj) { obj = nil; }
+#define _SG_OBJC_BRIDGE_RETAIN(obj) ((__bridge_retained void*)(obj))
+#define _SG_OBJC_BRIDGE_TAKE(ptr) ((__bridge_transfer id)(ptr))
+#define _SG_OBJC_BRIDGE_RELEASE(ptr) { (void)(__bridge_transfer id)(ptr); }
 #else
 #define _SG_OBJC_RETAIN(obj) { [obj retain]; }
 #define _SG_OBJC_RELEASE(obj) { [obj release]; obj = nil; }
+#define _SG_OBJC_BRIDGE_RETAIN(obj) ((void*)[(obj) retain])
+#define _SG_OBJC_BRIDGE_TAKE(ptr) ((id)(ptr))
+#define _SG_OBJC_BRIDGE_RELEASE(ptr) { [(id)(ptr) release]; }
 #endif
 
 //-- enum translation functions ------------------------------------------------
@@ -17196,6 +17243,196 @@ _SOKOL_PRIVATE void _sg_mtl_init_caps(void) {
     _sg_pixelformat_compute_all(&_sg.formats[SG_PIXELFORMAT_RGBA32F]);
 }
 
+//-- Sulrim: async shader/pipeline compiles, published by sg_commit on the main thread
+_SOKOL_PRIVATE void _sg_mtl_async_release(void** ptr) {
+    _SG_OBJC_BRIDGE_RELEASE(*ptr);
+    *ptr = 0;
+}
+
+_SOKOL_PRIVATE int _sg_mtl_async_add(void** ptr) {
+    id obj = _SG_OBJC_BRIDGE_TAKE(*ptr);
+    *ptr = 0;
+    const int slot_index = _sg_mtl_add_resource(obj);
+    _SG_OBJC_RELEASE(obj);
+    return slot_index;
+}
+
+_SOKOL_PRIVATE _sg_mtl_async_t* _sg_mtl_async_new(const _sg_slot_t* slot, bool is_pipeline) {
+    _sg_mtl_async_t* job = (_sg_mtl_async_t*)_sg_malloc_clear(sizeof(_sg_mtl_async_t));
+    job->sref = _sg_sref(slot);
+    job->is_pipeline = is_pipeline;
+    job->next = _sg.mtl.async;
+    _sg.mtl.async = job;
+    return job;
+}
+
+_SOKOL_PRIVATE void _sg_mtl_async_free(_sg_mtl_async_t* job) {
+    _sg_mtl_async_release(&job->desc);
+    for (int i = 0; i < 3; i++) {
+        _sg_mtl_async_release(&job->obj[i]);
+        _sg_mtl_async_release(&job->func[i]);
+        _sg_mtl_async_release(&job->err[i]);
+    }
+    _sg_free(job);
+}
+
+// completion handler side, any thread: the main thread reads results only after `pending` drops
+_SOKOL_PRIVATE void _sg_mtl_async_store(_sg_mtl_async_t* job, int i, id obj, id func, NSError* err) {
+    job->obj[i] = _SG_OBJC_BRIDGE_RETAIN(obj);
+    job->func[i] = _SG_OBJC_BRIDGE_RETAIN(func);
+    job->err[i] = _SG_OBJC_BRIDGE_RETAIN(err);
+    __atomic_fetch_sub(&job->pending, 1, __ATOMIC_RELEASE);
+}
+
+_SOKOL_PRIVATE void _sg_mtl_pipeline_desc_funcs(id desc, bool is_compute, const _sg_shader_t* shd) {
+    if (is_compute) {
+        SOKOL_ASSERT(shd->mtl.compute_func.mtl_func != _SG_MTL_INVALID_SLOT_INDEX);
+        ((MTLComputePipelineDescriptor*)desc).computeFunction = _sg_mtl_id(shd->mtl.compute_func.mtl_func);
+    } else {
+        SOKOL_ASSERT(shd->mtl.vertex_func.mtl_func != _SG_MTL_INVALID_SLOT_INDEX);
+        ((MTLRenderPipelineDescriptor*)desc).vertexFunction = _sg_mtl_id(shd->mtl.vertex_func.mtl_func);
+        if (shd->mtl.fragment_func.mtl_func != _SG_MTL_INVALID_SLOT_INDEX) {
+            ((MTLRenderPipelineDescriptor*)desc).fragmentFunction = _sg_mtl_id(shd->mtl.fragment_func.mtl_func);
+        }
+    }
+}
+
+_SOKOL_PRIVATE void _sg_mtl_async_issue(_sg_mtl_async_t* job, const _sg_pipeline_t* pip, const _sg_shader_t* shd) {
+    id desc = (__bridge id)job->desc;
+    _sg_mtl_pipeline_desc_funcs(desc, pip->cmn.is_compute, shd);
+    job->is_issued = true;
+    __atomic_store_n(&job->pending, 1, __ATOMIC_RELAXED);
+    dispatch_group_t group = _sg.mtl.async_group;
+    dispatch_group_enter(group);
+    if (pip->cmn.is_compute) {
+        [_sg.mtl.device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone
+            completionHandler:^(id<MTLComputePipelineState> state, MTLComputePipelineReflection* reflection, NSError* err) {
+                _SOKOL_UNUSED(reflection);
+                _sg_mtl_async_store(job, 0, state, nil, err);
+                dispatch_group_leave(group);
+            }];
+    } else {
+        [_sg.mtl.device newRenderPipelineStateWithDescriptor:desc
+            completionHandler:^(id<MTLRenderPipelineState> state, NSError* err) {
+                _sg_mtl_async_store(job, 0, state, nil, err);
+                dispatch_group_leave(group);
+            }];
+    }
+}
+
+// a pipeline over a PENDING shader waits in the job list until the shader publishes
+_SOKOL_PRIVATE void _sg_mtl_async_pipeline(const _sg_pipeline_t* pip, id desc) {
+    _sg_mtl_async_t* job = _sg_mtl_async_new(&pip->slot, true);
+    job->desc = _SG_OBJC_BRIDGE_RETAIN(desc);
+    const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+    if (shd->slot.state == SG_RESOURCESTATE_VALID) {
+        _sg_mtl_async_issue(job, pip, shd);
+    }
+}
+
+_SOKOL_PRIVATE bool _sg_mtl_async_publish_shader(_sg_mtl_async_t* job) {
+    if (__atomic_load_n(&job->pending, __ATOMIC_ACQUIRE) > 0) {
+        return false;
+    }
+    _sg_shader_t* shd = _sg_lookup_shader(job->sref.id);
+    if (!shd || !_sg_sref_slot_eql(&job->sref, &shd->slot) || (shd->slot.state != SG_RESOURCESTATE_PENDING)) {
+        return true;
+    }
+    _sg_mtl_shader_func_t* res[3] = { &shd->mtl.vertex_func, &shd->mtl.fragment_func, &shd->mtl.compute_func };
+    bool is_valid = true;
+    for (int i = 0; i < 3; i++) {
+        if (0 == (job->func_mask & (1 << i))) {
+            continue;
+        }
+        if (job->err[i]) {
+            _SG_ERROR(METAL_SHADER_COMPILATION_FAILED);
+            _SG_LOGMSG(METAL_SHADER_COMPILATION_OUTPUT, [((__bridge NSError*)job->err[i]).localizedDescription UTF8String]);
+        }
+        if (job->obj[i] && !job->func[i]) {
+            _SG_ERROR(METAL_SHADER_ENTRY_NOT_FOUND);
+        }
+        if (job->obj[i] && job->func[i]) {
+            res[i]->mtl_lib = _sg_mtl_async_add(&job->obj[i]);
+            res[i]->mtl_func = _sg_mtl_async_add(&job->func[i]);
+        } else {
+            is_valid = false;
+        }
+    }
+    shd->slot.state = is_valid ? SG_RESOURCESTATE_VALID : SG_RESOURCESTATE_FAILED;
+    return true;
+}
+
+_SOKOL_PRIVATE bool _sg_mtl_async_publish_pipeline(_sg_mtl_async_t* job) {
+    _sg_pipeline_t* pip = _sg_lookup_pipeline(job->sref.id);
+    const bool is_live = pip && _sg_sref_slot_eql(&job->sref, &pip->slot) && (pip->slot.state == SG_RESOURCESTATE_PENDING);
+    if (!job->is_issued) {
+        if (!is_live) {
+            return true;
+        }
+        const _sg_shader_t* shd = _sg_shader_ref_alive(&pip->cmn.shader) ? _sg_shader_ref_ptr(&pip->cmn.shader) : 0;
+        const sg_resource_state shd_state = shd ? shd->slot.state : SG_RESOURCESTATE_INVALID;
+        if (shd_state == SG_RESOURCESTATE_PENDING) {
+            return false;
+        }
+        if (shd_state != SG_RESOURCESTATE_VALID) {
+            pip->slot.state = SG_RESOURCESTATE_FAILED;
+            return true;
+        }
+        _sg_mtl_async_issue(job, pip, shd);
+    }
+    if (__atomic_load_n(&job->pending, __ATOMIC_ACQUIRE) > 0) {
+        return false;
+    }
+    if (!is_live) {
+        return true;
+    }
+    const int slot_index = _sg_mtl_async_add(&job->obj[0]);
+    const char* msg = job->err[0] ? [((__bridge NSError*)job->err[0]).localizedDescription UTF8String] : 0;
+    if (pip->cmn.is_compute) {
+        pip->mtl.cps = slot_index;
+        if (slot_index == _SG_MTL_INVALID_SLOT_INDEX) {
+            _SG_ERROR(METAL_CREATE_CPS_FAILED);
+            _SG_LOGMSG(METAL_CREATE_CPS_OUTPUT, msg);
+        }
+    } else {
+        pip->mtl.rps = slot_index;
+        if (slot_index == _SG_MTL_INVALID_SLOT_INDEX) {
+            _SG_ERROR(METAL_CREATE_RPS_FAILED);
+            _SG_LOGMSG(METAL_CREATE_RPS_OUTPUT, msg);
+        }
+    }
+    pip->slot.state = (slot_index != _SG_MTL_INVALID_SLOT_INDEX) ? SG_RESOURCESTATE_VALID : SG_RESOURCESTATE_FAILED;
+    return true;
+}
+
+// shaders first, so a pipeline waiting on one is issued in the same drain
+_SOKOL_PRIVATE void _sg_mtl_async_drain(void) {
+    for (int is_pipeline = 0; is_pipeline < 2; is_pipeline++) {
+        _sg_mtl_async_t** link = &_sg.mtl.async;
+        while (*link) {
+            _sg_mtl_async_t* job = *link;
+            const bool is_done = (job->is_pipeline == (is_pipeline == 1))
+                && (job->is_pipeline ? _sg_mtl_async_publish_pipeline(job) : _sg_mtl_async_publish_shader(job));
+            if (is_done) {
+                *link = job->next;
+                _sg_mtl_async_free(job);
+            } else {
+                link = &job->next;
+            }
+        }
+    }
+}
+
+// shutdown: late results are dropped, never published
+_SOKOL_PRIVATE void _sg_mtl_async_discard_all(void) {
+    dispatch_group_wait(_sg.mtl.async_group, DISPATCH_TIME_FOREVER);
+    while (_sg.mtl.async) {
+        _sg_mtl_async_t* job = _sg.mtl.async;
+        _sg.mtl.async = job->next;
+        _sg_mtl_async_free(job);
+    }
+}
+
 //-- main Metal backend state and functions ------------------------------------
 _SOKOL_PRIVATE void _sg_mtl_setup_backend(const sg_desc* desc) {
     // assume already zero-initialized
@@ -17207,6 +17444,12 @@ _SOKOL_PRIVATE void _sg_mtl_setup_backend(const sg_desc* desc) {
     _sg.mtl.valid = true;
     _sg.mtl.ub_size = desc->uniform_buffer_size;
     _sg.mtl.sem = dispatch_semaphore_create(SG_NUM_INFLIGHT_FRAMES);
+    _sg.mtl.async_group = dispatch_group_create();
+    _sg.mtl.compile_options = [[MTLCompileOptions alloc] init];
+    SOKOL_ASSERT(_sg.mtl.compile_options);
+    if (@available(macOS 11.0, iOS 14.0, *)) {
+        _sg.mtl.compile_options.preserveInvariance = YES;
+    }
     _sg.mtl.device = (__bridge id<MTLDevice>) desc->environment.metal.device;
     _SG_OBJC_RETAIN(_sg.mtl.device);
     _sg.mtl.cmd_queue = [_sg.mtl.device newCommandQueue];
@@ -17244,6 +17487,7 @@ _SOKOL_PRIVATE void _sg_mtl_setup_backend(const sg_desc* desc) {
 
 _SOKOL_PRIVATE void _sg_mtl_discard_backend(void) {
     SOKOL_ASSERT(_sg.mtl.valid);
+    _sg_mtl_async_discard_all();
     // wait for the last frame to finish
     for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) {
         dispatch_semaphore_wait(_sg.mtl.sem, DISPATCH_TIME_FOREVER);
@@ -17257,6 +17501,8 @@ _SOKOL_PRIVATE void _sg_mtl_discard_backend(void) {
     _sg.mtl.valid = false;
 
     _SG_OBJC_RELEASE(_sg.mtl.sem);
+    _SG_OBJC_RELEASE(_sg.mtl.async_group);
+    _SG_OBJC_RELEASE(_sg.mtl.compile_options);
     _SG_OBJC_RELEASE(_sg.mtl.device);
     _SG_OBJC_RELEASE(_sg.mtl.cmd_queue);
     for (int i = 0; i < SG_NUM_INFLIGHT_FRAMES; i++) {
@@ -17590,7 +17836,7 @@ _SOKOL_PRIVATE id<MTLLibrary> _sg_mtl_compile_library(const char* src) {
     NSError* err = NULL;
     id<MTLLibrary> lib = [_sg.mtl.device
         newLibraryWithSource:[NSString stringWithUTF8String:src]
-        options:nil
+        options:_sg.mtl.compile_options
         error:&err
     ];
     if (err) {
@@ -17701,6 +17947,55 @@ _SOKOL_PRIVATE bool _sg_mtl_ensure_msl_bindslot_ranges(const sg_shader_desc* des
     return true;
 }
 
+// Sulrim: bytecode functions load synchronously, source functions compile off-thread
+_SOKOL_PRIVATE sg_resource_state _sg_mtl_async_shader(_sg_shader_t* shd, const sg_shader_desc* desc) {
+    const sg_shader_function* funcs[3] = { &desc->vertex_func, &desc->fragment_func, &desc->compute_func };
+    _sg_mtl_shader_func_t* res[3] = { &shd->mtl.vertex_func, &shd->mtl.fragment_func, &shd->mtl.compute_func };
+    static const char* exts[3] = { "vs", "fs", "cs" };
+    int num_async = 0;
+    for (int i = 0; i < 3; i++) {
+        if (funcs[i]->bytecode.ptr) {
+            if (!_sg_mtl_create_shader_func(funcs[i], desc->label, exts[i], res[i])) {
+                return SG_RESOURCESTATE_FAILED;
+            }
+        } else if (funcs[i]->source) {
+            num_async++;
+        }
+    }
+    if (0 == num_async) {
+        return SG_RESOURCESTATE_VALID;
+    }
+    _sg_mtl_async_t* job = _sg_mtl_async_new(&shd->slot, false);
+    __atomic_store_n(&job->pending, num_async, __ATOMIC_RELAXED);
+    dispatch_group_t group = _sg.mtl.async_group;
+    for (int i = 0; i < 3; i++) {
+        if (funcs[i]->bytecode.ptr || !funcs[i]->source) {
+            continue;
+        }
+        SOKOL_ASSERT(funcs[i]->entry);
+        job->func_mask |= (uint8_t)(1 << i);
+        NSString* entry = [NSString stringWithUTF8String:funcs[i]->entry];
+        NSString* label = nil;
+        #if defined(SOKOL_DEBUG)
+        if (desc->label) {
+            label = [NSString stringWithFormat:@"%s.%s", desc->label, exts[i]];
+        }
+        #endif
+        dispatch_group_enter(group);
+        [_sg.mtl.device newLibraryWithSource:[NSString stringWithUTF8String:funcs[i]->source] options:_sg.mtl.compile_options
+            completionHandler:^(id<MTLLibrary> lib, NSError* err) {
+                if (label) {
+                    lib.label = label;
+                }
+                id<MTLFunction> func = [lib newFunctionWithName:entry];
+                _sg_mtl_async_store(job, i, lib, func, err);
+                _SG_OBJC_RELEASE(func);
+                dispatch_group_leave(group);
+            }];
+    }
+    return SG_RESOURCESTATE_PENDING;
+}
+
 _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_shader(_sg_shader_t* shd, const sg_shader_desc* desc) {
     SOKOL_ASSERT(shd && desc);
 
@@ -17735,6 +18030,9 @@ _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_shader(_sg_shader_t* shd, const 
     }
 
     // create metal library and function objects
+    if (desc->async_compile) {
+        return _sg_mtl_async_shader(shd, desc);
+    }
     bool shd_valid = true;
     if (desc->vertex_func.source || desc->vertex_func.bytecode.ptr) {
         shd_valid &= _sg_mtl_create_shader_func(&desc->vertex_func, desc->label, "vs", &shd->mtl.vertex_func);
@@ -17761,10 +18059,10 @@ _SOKOL_PRIVATE void _sg_mtl_discard_shader(_sg_shader_t* shd) {
 _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_pipeline(_sg_pipeline_t* pip, const sg_pipeline_desc* desc) {
     SOKOL_ASSERT(pip && desc);
     _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+    const bool is_async = desc->async_compile || (shd->slot.state == SG_RESOURCESTATE_PENDING);
     if (pip->cmn.is_compute) {
         NSError* err = NULL;
         MTLComputePipelineDescriptor* cp_desc = [[MTLComputePipelineDescriptor alloc] init];
-        cp_desc.computeFunction = _sg_mtl_id(shd->mtl.compute_func.mtl_func);
         cp_desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = true;
         for (size_t i = 0; i < SG_MAX_VIEW_BINDSLOTS; i++) {
             const _sg_shader_view_t* view = &shd->cmn.views[i];
@@ -17784,13 +18082,19 @@ _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_pipeline(_sg_pipeline_t* pip, co
                 cp_desc.label = [NSString stringWithFormat:@"%s", desc->label];
             }
         #endif
-        id<MTLComputePipelineState> mtl_cps = [_sg.mtl.device
-            newComputePipelineStateWithDescriptor:cp_desc
-            options:MTLPipelineOptionNone
-            reflection:nil
-            error:&err];
+        id<MTLComputePipelineState> mtl_cps = nil;
+        if (is_async) {
+            _sg_mtl_async_pipeline(pip, cp_desc);
+        } else {
+            _sg_mtl_pipeline_desc_funcs(cp_desc, true, shd);
+            mtl_cps = [_sg.mtl.device
+                newComputePipelineStateWithDescriptor:cp_desc
+                options:MTLPipelineOptionNone
+                reflection:nil
+                error:&err];
+        }
         _SG_OBJC_RELEASE(cp_desc);
-        if (nil == mtl_cps) {
+        if (!is_async && (nil == mtl_cps)) {
             SOKOL_ASSERT(err);
             _SG_ERROR(METAL_CREATE_CPS_FAILED);
             _SG_LOGMSG(METAL_CREATE_CPS_OUTPUT, [err.localizedDescription UTF8String]);
@@ -17837,11 +18141,6 @@ _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_pipeline(_sg_pipeline_t* pip, co
         // render-pipeline descriptor
         MTLRenderPipelineDescriptor* rp_desc = [[MTLRenderPipelineDescriptor alloc] init];
         rp_desc.vertexDescriptor = vtx_desc;
-        SOKOL_ASSERT(shd->mtl.vertex_func.mtl_func != _SG_MTL_INVALID_SLOT_INDEX);
-        rp_desc.vertexFunction = _sg_mtl_id(shd->mtl.vertex_func.mtl_func);
-        if (shd->mtl.fragment_func.mtl_func != _SG_MTL_INVALID_SLOT_INDEX) {
-            rp_desc.fragmentFunction = _sg_mtl_id(shd->mtl.fragment_func.mtl_func);
-        }
         rp_desc.rasterSampleCount = (NSUInteger)desc->sample_count;
         rp_desc.alphaToCoverageEnabled = desc->alpha_to_coverage_enabled;
         rp_desc.alphaToOneEnabled = NO;
@@ -17899,9 +18198,15 @@ _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_pipeline(_sg_pipeline_t* pip, co
             }
         #endif
         NSError* err = NULL;
-        id<MTLRenderPipelineState> mtl_rps = [_sg.mtl.device newRenderPipelineStateWithDescriptor:rp_desc error:&err];
+        id<MTLRenderPipelineState> mtl_rps = nil;
+        if (is_async) {
+            _sg_mtl_async_pipeline(pip, rp_desc);
+        } else {
+            _sg_mtl_pipeline_desc_funcs(rp_desc, false, shd);
+            mtl_rps = [_sg.mtl.device newRenderPipelineStateWithDescriptor:rp_desc error:&err];
+        }
         _SG_OBJC_RELEASE(rp_desc);
-        if (nil == mtl_rps) {
+        if (!is_async && (nil == mtl_rps)) {
             SOKOL_ASSERT(err);
             _SG_ERROR(METAL_CREATE_RPS_FAILED);
             _SG_LOGMSG(METAL_CREATE_RPS_OUTPUT, [err.localizedDescription UTF8String]);
@@ -17946,7 +18251,7 @@ _SOKOL_PRIVATE sg_resource_state _sg_mtl_create_pipeline(_sg_pipeline_t* pip, co
         pip->mtl.dss = _sg_mtl_add_resource(mtl_dss);
         _SG_OBJC_RELEASE(mtl_dss);
     }
-    return SG_RESOURCESTATE_VALID;
+    return is_async ? SG_RESOURCESTATE_PENDING : SG_RESOURCESTATE_VALID;
 }
 
 _SOKOL_PRIVATE void _sg_mtl_discard_pipeline(_sg_pipeline_t* pip) {
@@ -18306,6 +18611,7 @@ _SOKOL_PRIVATE void _sg_mtl_commit(void) {
     _sg.mtl.cur_ub_base_ptr = 0;
     // NOTE: MTLCommandBuffer is autoreleased
     _sg.mtl.cmd_buffer = nil;
+    _sg_mtl_async_drain();
 }
 
 _SOKOL_PRIVATE void _sg_mtl_apply_viewport(int x, int y, int w, int h, bool origin_top_left) {
@@ -20262,6 +20568,115 @@ _SOKOL_PRIVATE void _sg_wgpu_abandon_commands(void) {
     _sg.wgpu.retirement.stats.retired_unsubmitted_bytes = 0;
 }
 
+//-- Sulrim: async pipeline compiles, published by sg_commit
+// Emscripten delivers AllowSpontaneous callbacks on the calling thread's event loop, between
+// frames. Native Dawn may call back on any thread, so it keeps compiling synchronously.
+#if defined(__EMSCRIPTEN__)
+#define _SG_WGPU_ASYNC_COMPILE (true)
+#else
+#define _SG_WGPU_ASYNC_COMPILE (false)
+#endif
+static uint32_t _sg_wgpu_async_ticket; // outlives sg_shutdown: late callbacks never match a new session
+
+_SOKOL_PRIVATE void _sg_wgpu_async_new(const _sg_pipeline_t* pip, void** userdata1, void** userdata2) {
+    SOKOL_ASSERT(_sg_wgpu_async_ticket != UINT32_MAX);
+    _sg_wgpu_async_t* job = (_sg_wgpu_async_t*)_sg_malloc_clear(sizeof(_sg_wgpu_async_t));
+    job->sref = _sg_sref(&pip->slot);
+    job->ticket = ++_sg_wgpu_async_ticket;
+    job->next = _sg.wgpu.async;
+    _sg.wgpu.async = job;
+    *userdata1 = (void*)(uintptr_t)job->sref.id;
+    *userdata2 = (void*)(uintptr_t)job->ticket;
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_async_free(_sg_wgpu_async_t* job) {
+    if (job->rpip) {
+        wgpuRenderPipelineRelease(job->rpip);
+    }
+    if (job->cpip) {
+        wgpuComputePipelineRelease(job->cpip);
+    }
+    if (job->msg) {
+        _sg_free(job->msg);
+    }
+    _sg_free(job);
+}
+
+// callback side: match (pipeline id, ticket) to a live job, or 0 when destroyed/shut down
+_SOKOL_PRIVATE _sg_wgpu_async_t* _sg_wgpu_async_match(WGPUCreatePipelineAsyncStatus status, WGPUStringView msg, void* userdata1, void* userdata2) {
+    for (_sg_wgpu_async_t* job = _sg.wgpu.async; job; job = job->next) {
+        if ((job->sref.id != (uint32_t)(uintptr_t)userdata1) || (job->ticket != (uint32_t)(uintptr_t)userdata2)) {
+            continue;
+        }
+        job->is_done = true;
+        if (status != WGPUCreatePipelineAsyncStatus_Success) {
+            const size_t len = (msg.length == WGPU_STRLEN) ? (msg.data ? strlen(msg.data) : 0) : msg.length;
+            job->msg = (char*)_sg_malloc_clear(len + 1);
+            if (len > 0) {
+                memcpy(job->msg, msg.data, len);
+            }
+        }
+        return job;
+    }
+    return 0;
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_async_render_done(WGPUCreatePipelineAsyncStatus status, WGPURenderPipeline rpip, WGPUStringView msg, void* userdata1, void* userdata2) {
+    _sg_wgpu_async_t* job = _sg_wgpu_async_match(status, msg, userdata1, userdata2);
+    if (job) {
+        job->rpip = rpip;
+    } else if (rpip) {
+        wgpuRenderPipelineRelease(rpip);
+    }
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_async_compute_done(WGPUCreatePipelineAsyncStatus status, WGPUComputePipeline cpip, WGPUStringView msg, void* userdata1, void* userdata2) {
+    _sg_wgpu_async_t* job = _sg_wgpu_async_match(status, msg, userdata1, userdata2);
+    if (job) {
+        job->cpip = cpip;
+    } else if (cpip) {
+        wgpuComputePipelineRelease(cpip);
+    }
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_async_drain(void) {
+    _sg_wgpu_async_t** link = &_sg.wgpu.async;
+    while (*link) {
+        _sg_wgpu_async_t* job = *link;
+        if (!job->is_done) {
+            link = &job->next;
+            continue;
+        }
+        *link = job->next;
+        _sg_pipeline_t* pip = _sg_lookup_pipeline(job->sref.id);
+        if (pip && _sg_sref_slot_eql(&job->sref, &pip->slot) && (pip->slot.state == SG_RESOURCESTATE_PENDING)) {
+            pip->wgpu.rpip = job->rpip;
+            pip->wgpu.cpip = job->cpip;
+            job->rpip = 0;
+            job->cpip = 0;
+            if (pip->wgpu.rpip || pip->wgpu.cpip) {
+                pip->slot.state = SG_RESOURCESTATE_VALID;
+            } else if (pip->cmn.is_compute) {
+                pip->slot.state = SG_RESOURCESTATE_FAILED;
+                _sg_log(SG_LOGITEM_WGPU_CREATE_COMPUTE_PIPELINE_FAILED, 1, job->msg, __LINE__);
+            } else {
+                pip->slot.state = SG_RESOURCESTATE_FAILED;
+                _sg_log(SG_LOGITEM_WGPU_CREATE_RENDER_PIPELINE_FAILED, 1, job->msg, __LINE__);
+            }
+        }
+        _sg_wgpu_async_free(job);
+    }
+}
+
+// shutdown: pending callbacks find no job and release their late result
+_SOKOL_PRIVATE void _sg_wgpu_async_discard_all(void) {
+    while (_sg.wgpu.async) {
+        _sg_wgpu_async_t* job = _sg.wgpu.async;
+        _sg.wgpu.async = job->next;
+        _sg_wgpu_async_free(job);
+    }
+}
+
 _SOKOL_PRIVATE void _sg_wgpu_setup_backend(const sg_desc* desc) {
     SOKOL_ASSERT(desc);
     SOKOL_ASSERT(desc->environment.wgpu.device);
@@ -20282,6 +20697,7 @@ _SOKOL_PRIVATE void _sg_wgpu_setup_backend(const sg_desc* desc) {
 _SOKOL_PRIVATE void _sg_wgpu_discard_backend(void) {
     SOKOL_ASSERT(_sg.wgpu.valid);
     _sg.wgpu.valid = false;
+    _sg_wgpu_async_discard_all();
     _sg_wgpu_discard_all_bindgroups();
     _sg_wgpu_bindgroups_cache_discard();
     _sg_wgpu_bindgroups_pool_discard();
@@ -20883,6 +21299,7 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_pipeline(_sg_pipeline_t* pip, c
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
     SOKOL_ASSERT(shd->wgpu.bgl_ub);
     SOKOL_ASSERT(shd->wgpu.bgl_view_smp);
+    const bool is_async = _SG_WGPU_ASYNC_COMPILE && desc->async_compile;
 
     pip->wgpu.blend_color.r = (double) desc->blend_color.r;
     pip->wgpu.blend_color.g = (double) desc->blend_color.g;
@@ -20911,9 +21328,17 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_pipeline(_sg_pipeline_t* pip, c
         wgpu_pip_desc.layout = wgpu_pip_layout;
         wgpu_pip_desc.compute.module = shd->wgpu.compute_func.module;
         wgpu_pip_desc.compute.entryPoint = _sg_wgpu_stringview(shd->wgpu.compute_func.entry.buf);
-        pip->wgpu.cpip = wgpuDeviceCreateComputePipeline(_sg.wgpu.dev, &wgpu_pip_desc);
+        if (is_async) {
+            _SG_STRUCT(WGPUCreateComputePipelineAsyncCallbackInfo, cb_info);
+            cb_info.mode = WGPUCallbackMode_AllowSpontaneous;
+            cb_info.callback = _sg_wgpu_async_compute_done;
+            _sg_wgpu_async_new(pip, &cb_info.userdata1, &cb_info.userdata2);
+            wgpuDeviceCreateComputePipelineAsync(_sg.wgpu.dev, &wgpu_pip_desc, cb_info);
+        } else {
+            pip->wgpu.cpip = wgpuDeviceCreateComputePipeline(_sg.wgpu.dev, &wgpu_pip_desc);
+        }
         wgpuPipelineLayoutRelease(wgpu_pip_layout);
-        if (0 == pip->wgpu.cpip) {
+        if (!is_async && (0 == pip->wgpu.cpip)) {
             _SG_ERROR(WGPU_CREATE_COMPUTE_PIPELINE_FAILED);
             return SG_RESOURCESTATE_FAILED;
         }
@@ -21008,14 +21433,22 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_pipeline(_sg_pipeline_t* pip, c
             }
             wgpu_pip_desc.fragment = &wgpu_frag_state;
         }
-        pip->wgpu.rpip = wgpuDeviceCreateRenderPipeline(_sg.wgpu.dev, &wgpu_pip_desc);
+        if (is_async) {
+            _SG_STRUCT(WGPUCreateRenderPipelineAsyncCallbackInfo, cb_info);
+            cb_info.mode = WGPUCallbackMode_AllowSpontaneous;
+            cb_info.callback = _sg_wgpu_async_render_done;
+            _sg_wgpu_async_new(pip, &cb_info.userdata1, &cb_info.userdata2);
+            wgpuDeviceCreateRenderPipelineAsync(_sg.wgpu.dev, &wgpu_pip_desc, cb_info);
+        } else {
+            pip->wgpu.rpip = wgpuDeviceCreateRenderPipeline(_sg.wgpu.dev, &wgpu_pip_desc);
+        }
         wgpuPipelineLayoutRelease(wgpu_pip_layout);
-        if (0 == pip->wgpu.rpip) {
+        if (!is_async && (0 == pip->wgpu.rpip)) {
             _SG_ERROR(WGPU_CREATE_RENDER_PIPELINE_FAILED);
             return SG_RESOURCESTATE_FAILED;
         }
     }
-    return SG_RESOURCESTATE_VALID;
+    return is_async ? SG_RESOURCESTATE_PENDING : SG_RESOURCESTATE_VALID;
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_discard_pipeline(_sg_pipeline_t* pip) {
@@ -21212,6 +21645,7 @@ _SOKOL_PRIVATE void _sg_wgpu_end_pass(const _sg_attachments_ptrs_t* atts) {
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_commit(void) {
+    _sg_wgpu_async_drain();
     if (!_sg.wgpu.cmd_enc) {
         // Service submitted or never-encoded retirements even without a pass.
         _sg_wgpu_retirement_drain(_SG_WGPU_RETIREMENT_BATCH);
@@ -26313,7 +26747,7 @@ _SOKOL_PRIVATE bool _sg_validate_pipeline_desc(const sg_pipeline_desc* desc) {
         const _sg_shader_t* shd = _sg_lookup_shader(desc->shader.id);
         _SG_VALIDATE(0 != shd, VALIDATE_PIPELINEDESC_SHADER);
         if (shd) {
-            _SG_VALIDATE(shd->slot.state == SG_RESOURCESTATE_VALID, VALIDATE_PIPELINEDESC_SHADER);
+            _SG_VALIDATE((shd->slot.state == SG_RESOURCESTATE_VALID) || (shd->slot.state == SG_RESOURCESTATE_PENDING), VALIDATE_PIPELINEDESC_SHADER);
             if (desc->compute) {
                 _SG_VALIDATE(shd->cmn.is_compute, VALIDATE_PIPELINEDESC_COMPUTE_SHADER_EXPECTED);
             } else {
@@ -28223,7 +28657,7 @@ _SOKOL_PRIVATE void _sg_init_shader(_sg_shader_t* shd, const sg_shader_desc* des
     }
     _sg_shader_common_init(&shd->cmn, desc);
     shd->slot.state = _sg_create_shader(shd, desc);
-    SOKOL_ASSERT(_sg_resource_state_valid_failed(shd->slot.state));
+    SOKOL_ASSERT(_sg_resource_state_valid_failed_pending(shd->slot.state));
     _sg_resource_stats_inc(shaders.inited);
 }
 
@@ -28232,7 +28666,7 @@ _SOKOL_PRIVATE void _sg_init_pipeline(_sg_pipeline_t* pip, const sg_pipeline_des
     SOKOL_ASSERT(desc);
     if (_sg_validate_pipeline_desc(desc)) {
         _sg_shader_t* shd = _sg_lookup_shader(desc->shader.id);
-        if (shd && (shd->slot.state == SG_RESOURCESTATE_VALID)) {
+        if (shd && ((shd->slot.state == SG_RESOURCESTATE_VALID) || (shd->slot.state == SG_RESOURCESTATE_PENDING))) {
             _sg_pipeline_common_init(&pip->cmn, desc, shd);
             pip->slot.state = _sg_create_pipeline(pip, desc);
         } else {
@@ -28241,7 +28675,7 @@ _SOKOL_PRIVATE void _sg_init_pipeline(_sg_pipeline_t* pip, const sg_pipeline_des
     } else {
         pip->slot.state = SG_RESOURCESTATE_FAILED;
     }
-    SOKOL_ASSERT(_sg_resource_state_valid_failed(pip->slot.state));
+    SOKOL_ASSERT(_sg_resource_state_valid_failed_pending(pip->slot.state));
     _sg_resource_stats_inc(pipelines.inited);
 }
 
@@ -28300,14 +28734,14 @@ _SOKOL_PRIVATE void _sg_uninit_sampler(_sg_sampler_t* smp) {
 }
 
 _SOKOL_PRIVATE void _sg_uninit_shader(_sg_shader_t* shd) {
-    SOKOL_ASSERT(shd && _sg_resource_state_valid_failed(shd->slot.state));
+    SOKOL_ASSERT(shd && _sg_resource_state_valid_failed_pending(shd->slot.state));
     _sg_discard_shader(shd);
     _sg_reset_shader_to_alloc_state(shd);
     _sg_resource_stats_inc(shaders.uninited);
 }
 
 _SOKOL_PRIVATE void _sg_uninit_pipeline(_sg_pipeline_t* pip) {
-    SOKOL_ASSERT(pip && _sg_resource_state_valid_failed(pip->slot.state));
+    SOKOL_ASSERT(pip && _sg_resource_state_valid_failed_pending(pip->slot.state));
     _sg_discard_pipeline(pip);
     _sg_reset_pipeline_to_alloc_state(pip);
     _sg_resource_stats_inc(pipelines.uninited);
@@ -28516,13 +28950,13 @@ _SOKOL_PRIVATE void _sg_discard_all_resources(void) {
     }
     for (int i = 1; i < _sg.pools.shader_pool.size; i++) {
         sg_resource_state state = _sg.pools.shaders[i].slot.state;
-        if (_sg_resource_state_valid_failed(state)) {
+        if (_sg_resource_state_valid_failed_pending(state)) {
             _sg_discard_shader(&_sg.pools.shaders[i]);
         }
     }
     for (int i = 1; i < _sg.pools.pipeline_pool.size; i++) {
         sg_resource_state state = _sg.pools.pipelines[i].slot.state;
-        if (_sg_resource_state_valid_failed(state)) {
+        if (_sg_resource_state_valid_failed_pending(state)) {
             _sg_discard_pipeline(&_sg.pools.pipelines[i]);
         }
     }
@@ -28859,7 +29293,7 @@ SOKOL_API_IMPL void sg_init_shader(sg_shader shd_id, const sg_shader_desc* desc)
     if (shd) {
         if (shd->slot.state == SG_RESOURCESTATE_ALLOC) {
             _sg_init_shader(shd, &desc_def);
-            SOKOL_ASSERT(_sg_resource_state_valid_failed(shd->slot.state));
+            SOKOL_ASSERT(_sg_resource_state_valid_failed_pending(shd->slot.state));
         } else {
             _SG_ERROR(INIT_SHADER_INVALID_STATE);
         }
@@ -28875,7 +29309,7 @@ SOKOL_API_IMPL void sg_init_pipeline(sg_pipeline pip_id, const sg_pipeline_desc*
     if (pip) {
         if (pip->slot.state == SG_RESOURCESTATE_ALLOC) {
             _sg_init_pipeline(pip, &desc_def);
-            SOKOL_ASSERT(_sg_resource_state_valid_failed(pip->slot.state));
+            SOKOL_ASSERT(_sg_resource_state_valid_failed_pending(pip->slot.state));
         } else {
             _SG_ERROR(INIT_PIPELINE_INVALID_STATE);
         }
@@ -28945,7 +29379,7 @@ SOKOL_API_IMPL void sg_uninit_shader(sg_shader shd_id) {
     SOKOL_ASSERT(_sg.valid);
     _sg_shader_t* shd = _sg_lookup_shader(shd_id.id);
     if (shd) {
-        if (_sg_resource_state_valid_failed(shd->slot.state)) {
+        if (_sg_resource_state_valid_failed_pending(shd->slot.state)) {
             _sg_uninit_shader(shd);
             SOKOL_ASSERT(shd->slot.state == SG_RESOURCESTATE_ALLOC);
         } else if (shd->slot.state != SG_RESOURCESTATE_ALLOC) {
@@ -28959,7 +29393,7 @@ SOKOL_API_IMPL void sg_uninit_pipeline(sg_pipeline pip_id) {
     SOKOL_ASSERT(_sg.valid);
     _sg_pipeline_t* pip = _sg_lookup_pipeline(pip_id.id);
     if (pip) {
-        if (_sg_resource_state_valid_failed(pip->slot.state)) {
+        if (_sg_resource_state_valid_failed_pending(pip->slot.state)) {
             _sg_uninit_pipeline(pip);
             SOKOL_ASSERT(pip->slot.state == SG_RESOURCESTATE_ALLOC);
         } else if (pip->slot.state != SG_RESOURCESTATE_ALLOC) {
@@ -29157,7 +29591,7 @@ SOKOL_API_IMPL sg_shader sg_make_shader(const sg_shader_desc* desc) {
         _sg_shader_t* shd = _sg_shader_at(shd_id.id);
         SOKOL_ASSERT(shd && (shd->slot.state == SG_RESOURCESTATE_ALLOC));
         _sg_init_shader(shd, &desc_def);
-        SOKOL_ASSERT(_sg_resource_state_valid_failed(shd->slot.state));
+        SOKOL_ASSERT(_sg_resource_state_valid_failed_pending(shd->slot.state));
     }
     _SG_TRACE_ARGS(make_shader, &desc_def, shd_id);
     return shd_id;
@@ -29172,7 +29606,7 @@ SOKOL_API_IMPL sg_pipeline sg_make_pipeline(const sg_pipeline_desc* desc) {
         _sg_pipeline_t* pip = _sg_pipeline_at(pip_id.id);
         SOKOL_ASSERT(pip && (pip->slot.state == SG_RESOURCESTATE_ALLOC));
         _sg_init_pipeline(pip, &desc_def);
-        SOKOL_ASSERT(_sg_resource_state_valid_failed(pip->slot.state));
+        SOKOL_ASSERT(_sg_resource_state_valid_failed_pending(pip->slot.state));
     }
     _SG_TRACE_ARGS(make_pipeline, &desc_def, pip_id);
     return pip_id;
@@ -29246,7 +29680,7 @@ SOKOL_API_IMPL void sg_destroy_shader(sg_shader shd_id) {
     _SG_TRACE_ARGS(destroy_shader, shd_id);
     _sg_shader_t* shd = _sg_lookup_shader(shd_id.id);
     if (shd) {
-        if (_sg_resource_state_valid_failed(shd->slot.state)) {
+        if (_sg_resource_state_valid_failed_pending(shd->slot.state)) {
             _sg_uninit_shader(shd);
             SOKOL_ASSERT(shd->slot.state == SG_RESOURCESTATE_ALLOC);
         }
@@ -29262,7 +29696,7 @@ SOKOL_API_IMPL void sg_destroy_pipeline(sg_pipeline pip_id) {
     _SG_TRACE_ARGS(destroy_pipeline, pip_id);
     _sg_pipeline_t* pip = _sg_lookup_pipeline(pip_id.id);
     if (pip) {
-        if (_sg_resource_state_valid_failed(pip->slot.state)) {
+        if (_sg_resource_state_valid_failed_pending(pip->slot.state)) {
             _sg_uninit_pipeline(pip);
             SOKOL_ASSERT(pip->slot.state == SG_RESOURCESTATE_ALLOC);
         }
@@ -29378,6 +29812,13 @@ SOKOL_API_IMPL void sg_apply_pipeline(sg_pipeline pip_id) {
     if (!_sg.cur_pass.valid) {
         return;
     }
+    const _sg_pipeline_t* pending_pip = _sg_lookup_pipeline(pip_id.id);
+    _sg.cur_pip_pending = pending_pip && (pending_pip->slot.state == SG_RESOURCESTATE_PENDING);
+    if (_sg.cur_pip_pending) {
+        _sg.cur_pip = _sg_pipeline_ref(0);
+        _sg.next_draw_valid = false;
+        return;
+    }
     if (!_sg_validate_apply_pipeline(pip_id)) {
         _sg.next_draw_valid = false;
         return;
@@ -29401,7 +29842,7 @@ SOKOL_API_IMPL void sg_apply_bindings(const sg_bindings* bindings) {
     SOKOL_ASSERT(bindings);
     _sg_stats_inc(num_apply_bindings);
     _SG_TRACE_ARGS(apply_bindings, bindings);
-    if (!_sg.cur_pass.valid) {
+    if (!_sg.cur_pass.valid || _sg.cur_pip_pending) {
         return;
     }
     if (!_sg_validate_apply_bindings(bindings)) {
@@ -29485,7 +29926,7 @@ _SOKOL_PRIVATE void _sg_apply_uniforms_checked(int ub_slot, const sg_range* data
     if (data_id) { _sg_stats_inc(num_apply_uniforms_cached); }
     _sg_stats_add(size_apply_uniforms, (uint32_t)data->size);
     _SG_TRACE_ARGS(apply_uniforms, ub_slot, data);
-    if (!_sg.cur_pass.valid) {
+    if (!_sg.cur_pass.valid || _sg.cur_pip_pending) {
         return;
     }
     if (!_sg_validate_apply_uniforms(ub_slot, data, data_id)) {
@@ -29589,6 +30030,9 @@ SOKOL_API_IMPL void sg_draw_ex(int base_element, int num_elements, int num_insta
 
 _SOKOL_PRIVATE void _sg_draw_indirect_checked(sg_buffer arguments, size_t offset_bytes, bool is_indexed) {
     SOKOL_ASSERT(_sg.valid);
+    if (_sg.cur_pip_pending) {
+        return;
+    }
     _sg_buffer_t* args = _sg_lookup_buffer(arguments.id);
     if (!_sg_validate_draw_indirect(args, offset_bytes, is_indexed)) {
         return;
@@ -29651,6 +30095,7 @@ SOKOL_API_IMPL void sg_end_pass(void) {
         _sg_end_pass(&atts_ptrs);
     }
     _sg.cur_pip = _sg_pipeline_ref(0);
+    _sg.cur_pip_pending = false;
     _sg_clear(&_sg.cur_pass, sizeof(_sg.cur_pass));
 }
 

@@ -438,6 +438,38 @@ typedef struct WGPUChainedStruct {
     WGPUSType sType;
 } WGPUChainedStruct;
 
+// Async callbacks are injected by tests; native Sokol uses synchronous creation.
+typedef enum WGPUCreatePipelineAsyncStatus {
+    WGPUCreatePipelineAsyncStatus_Success = 1,
+    WGPUCreatePipelineAsyncStatus_CallbackCancelled = 2,
+    WGPUCreatePipelineAsyncStatus_ValidationError = 3,
+    WGPUCreatePipelineAsyncStatus_InternalError = 4,
+    WGPUCreatePipelineAsyncStatus_Force32 = 0x7FFFFFFF
+} WGPUCreatePipelineAsyncStatus;
+typedef enum WGPUCallbackMode {
+    WGPUCallbackMode_WaitAnyOnly = 1,
+    WGPUCallbackMode_AllowProcessEvents = 2,
+    WGPUCallbackMode_AllowSpontaneous = 3,
+    WGPUCallbackMode_Force32 = 0x7FFFFFFF
+} WGPUCallbackMode;
+typedef struct WGPUFuture { uint64_t id; } WGPUFuture;
+typedef void (*WGPUCreateRenderPipelineAsyncCallback)(WGPUCreatePipelineAsyncStatus, WGPURenderPipeline, WGPUStringView, void*, void*);
+typedef void (*WGPUCreateComputePipelineAsyncCallback)(WGPUCreatePipelineAsyncStatus, WGPUComputePipeline, WGPUStringView, void*, void*);
+typedef struct WGPUCreateRenderPipelineAsyncCallbackInfo {
+    WGPUChainedStruct* nextInChain;
+    WGPUCallbackMode mode;
+    WGPUCreateRenderPipelineAsyncCallback callback;
+    void* userdata1;
+    void* userdata2;
+} WGPUCreateRenderPipelineAsyncCallbackInfo;
+typedef struct WGPUCreateComputePipelineAsyncCallbackInfo {
+    WGPUChainedStruct* nextInChain;
+    WGPUCallbackMode mode;
+    WGPUCreateComputePipelineAsyncCallback callback;
+    void* userdata1;
+    void* userdata2;
+} WGPUCreateComputePipelineAsyncCallbackInfo;
+
 typedef struct WGPUColor { double r, g, b, a; } WGPUColor;
 typedef struct WGPUExtent3D { uint32_t width, height, depthOrArrayLayers; } WGPUExtent3D;
 typedef struct WGPUOrigin3D { uint32_t x, y, z; } WGPUOrigin3D;
@@ -805,6 +837,8 @@ WGPUBindGroup wgpuDeviceCreateBindGroup(WGPUDevice device, const WGPUBindGroupDe
 WGPUPipelineLayout wgpuDeviceCreatePipelineLayout(WGPUDevice device, const WGPUPipelineLayoutDescriptor* desc);
 WGPURenderPipeline wgpuDeviceCreateRenderPipeline(WGPUDevice device, const WGPURenderPipelineDescriptor* desc);
 WGPUComputePipeline wgpuDeviceCreateComputePipeline(WGPUDevice device, const WGPUComputePipelineDescriptor* desc);
+WGPUFuture wgpuDeviceCreateRenderPipelineAsync(WGPUDevice device, const WGPURenderPipelineDescriptor* desc, WGPUCreateRenderPipelineAsyncCallbackInfo callback);
+WGPUFuture wgpuDeviceCreateComputePipelineAsync(WGPUDevice device, const WGPUComputePipelineDescriptor* desc, WGPUCreateComputePipelineAsyncCallbackInfo callback);
 WGPUCommandEncoder wgpuDeviceCreateCommandEncoder(WGPUDevice device, const WGPUCommandEncoderDescriptor* desc);
 
 void wgpuBufferAddRef(WGPUBuffer buffer);

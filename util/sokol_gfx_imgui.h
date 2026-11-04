@@ -1282,6 +1282,7 @@ _SOKOL_PRIVATE const char* _sgimgui_resourcestate_string(sg_resource_state s) {
         case SG_RESOURCESTATE_INITIAL:  return "INITIAL";
         case SG_RESOURCESTATE_ALLOC:    return "ALLOC";
         case SG_RESOURCESTATE_UNSEALED: return "UNSEALED";
+        case SG_RESOURCESTATE_PENDING:  return "PENDING";
         case SG_RESOURCESTATE_VALID:    return "VALID";
         case SG_RESOURCESTATE_FAILED:   return "FAILED";
         default:                        return "INVALID";
