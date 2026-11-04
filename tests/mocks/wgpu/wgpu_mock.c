@@ -121,6 +121,7 @@ static const fmt_info_t g_fmt_table[] = {
     { WGPUTextureFormat_RGBA32Float, WGPUTextureFormat_RGBA32Float, 1, 1, 16, F_F32 },
     { WGPUTextureFormat_RGBA32Uint, WGPUTextureFormat_RGBA32Uint, 1, 1, 16, F_UINT },
     { WGPUTextureFormat_RGBA32Sint, WGPUTextureFormat_RGBA32Sint, 1, 1, 16, F_SINT },
+    { WGPUTextureFormat_Depth16Unorm, WGPUTextureFormat_Depth16Unorm, 1, 1, 2, F_DEPTH },
     { WGPUTextureFormat_Depth32Float, WGPUTextureFormat_Depth32Float, 1, 1, 4, F_DEPTH },
     { WGPUTextureFormat_Depth32FloatStencil8, WGPUTextureFormat_Depth32FloatStencil8, 1, 1, 8, F_DEPTH|F_STENCIL },
     { WGPUTextureFormat_BC1RGBAUnorm, WGPUTextureFormat_BC1RGBAUnorm, 4, 4, 8, F_COMP },
@@ -3155,6 +3156,27 @@ void wgpuRenderPassEncoderDrawIndexed(WGPURenderPassEncoder enc, uint32_t index_
     g_rpe.last_first_vertex_or_index = first_index;
     g_rpe.last_base_vertex = base_vertex;
     g_rpe.last_first_instance = first_instance;
+}
+
+static void render_indirect(WGPURenderPassEncoder enc, WGPUBuffer arguments, uint64_t offset, bool indexed) {
+    const char* fn = indexed ? "wgpuRenderPassEncoderDrawIndexedIndirect" : "wgpuRenderPassEncoderDrawIndirect";
+    wgpu_mock_call_t* c = begin_call(indexed ? WGPU_MOCK_FUNC_wgpuRenderPassEncoderDrawIndexedIndirect : WGPU_MOCK_FUNC_wgpuRenderPassEncoderDrawIndirect, enc);
+    arg_p(c, arguments); arg_u(c, offset);
+    obj_t* pass = rpass(enc, fn);
+    obj_t* buffer = lookup(arguments, WGPU_MOCK_OBJ_BUFFER, fn);
+    if (pass && buffer) {
+        if (!(buffer->u.buffer.info.usage & WGPUBufferUsage_Indirect) || (offset & 3)
+            || !range_ok(offset, indexed ? 20 : 16, buffer->u.buffer.info.size)) { err("%s: invalid argument buffer range or usage", fn); }
+        add_ref(pass, buffer);
+    }
+}
+
+void wgpuRenderPassEncoderDrawIndirect(WGPURenderPassEncoder enc, WGPUBuffer arguments, uint64_t offset) {
+    render_indirect(enc, arguments, offset, false);
+}
+
+void wgpuRenderPassEncoderDrawIndexedIndirect(WGPURenderPassEncoder enc, WGPUBuffer arguments, uint64_t offset) {
+    render_indirect(enc, arguments, offset, true);
 }
 
 void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder enc) {

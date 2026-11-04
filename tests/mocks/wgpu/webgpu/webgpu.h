@@ -339,6 +339,7 @@ typedef enum WGPUTextureFormat {
     WGPUTextureFormat_RGBA32Float = 0x00000029,
     WGPUTextureFormat_RGBA32Uint = 0x0000002A,
     WGPUTextureFormat_RGBA32Sint = 0x0000002B,
+    WGPUTextureFormat_Depth16Unorm = 0x0000002D,
     WGPUTextureFormat_Depth32Float = 0x00000030,
     WGPUTextureFormat_Depth32FloatStencil8 = 0x00000031,
     WGPUTextureFormat_BC1RGBAUnorm = 0x00000032,
@@ -408,6 +409,7 @@ static const WGPUBufferUsage WGPUBufferUsage_Index = 0x0000000000000010;
 static const WGPUBufferUsage WGPUBufferUsage_Vertex = 0x0000000000000020;
 static const WGPUBufferUsage WGPUBufferUsage_Uniform = 0x0000000000000040;
 static const WGPUBufferUsage WGPUBufferUsage_Storage = 0x0000000000000080;
+static const WGPUBufferUsage WGPUBufferUsage_Indirect = 0x0000000000000100;
 
 typedef WGPUFlags WGPUColorWriteMask;
 static const WGPUColorWriteMask WGPUColorWriteMask_None = 0x0000000000000000;
@@ -853,6 +855,8 @@ void wgpuRenderPassEncoderSetIndexBuffer(WGPURenderPassEncoder enc, WGPUBuffer b
 void wgpuRenderPassEncoderSetVertexBuffer(WGPURenderPassEncoder enc, uint32_t slot, WGPUBuffer buf, uint64_t offset, uint64_t size);
 void wgpuRenderPassEncoderDraw(WGPURenderPassEncoder enc, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance);
 void wgpuRenderPassEncoderDrawIndexed(WGPURenderPassEncoder enc, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t base_vertex, uint32_t first_instance);
+void wgpuRenderPassEncoderDrawIndirect(WGPURenderPassEncoder enc, WGPUBuffer arguments, uint64_t offset);
+void wgpuRenderPassEncoderDrawIndexedIndirect(WGPURenderPassEncoder enc, WGPUBuffer arguments, uint64_t offset);
 void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder enc);
 void wgpuRenderPassEncoderRelease(WGPURenderPassEncoder enc);
 

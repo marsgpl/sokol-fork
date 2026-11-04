@@ -126,6 +126,8 @@
     _WGPUM_XMACRO(wgpuRenderPassEncoderSetVertexBuffer) \
     _WGPUM_XMACRO(wgpuRenderPassEncoderDraw) \
     _WGPUM_XMACRO(wgpuRenderPassEncoderDrawIndexed) \
+    _WGPUM_XMACRO(wgpuRenderPassEncoderDrawIndirect) \
+    _WGPUM_XMACRO(wgpuRenderPassEncoderDrawIndexedIndirect) \
     _WGPUM_XMACRO(wgpuRenderPassEncoderEnd) \
     _WGPUM_XMACRO(wgpuRenderPassEncoderRelease)
 

@@ -1393,6 +1393,7 @@ _SOKOL_PRIVATE const char* _sgimgui_pixelformat_string(sg_pixel_format fmt) {
         case SG_PIXELFORMAT_RGBA32F: return "RGBA32F";
         case SG_PIXELFORMAT_DEPTH: return "DEPTH";
         case SG_PIXELFORMAT_DEPTH_STENCIL: return "DEPTH_STENCIL";
+        case SG_PIXELFORMAT_DEPTH16: return "DEPTH16";
         case SG_PIXELFORMAT_BC1_RGBA: return "BC1_RGBA";
         case SG_PIXELFORMAT_BC2_RGBA: return "BC2_RGBA";
         case SG_PIXELFORMAT_BC3_RGBA: return "BC3_RGBA";
