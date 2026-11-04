@@ -3505,6 +3505,16 @@ typedef struct sg_pass {
     sg_attachments attachments;
     sg_swapchain swapchain;
     const char* label;
+    // Sulrim: optional stage-boundary counters, borrowed until command completion.
+    struct {
+        const void* sample_buffer;
+        uint32_t sample_index; // render: vertex start/end, fragment start/end; compute: start/end
+        bool defer_present; // keep a split swapchain drawable until commit
+    } metal;
+    // Sulrim: nonzero selects this pass's end query instead of query 1.
+    struct {
+        uint32_t end_query;
+    } wgpu;
     uint32_t _end_canary;
 } sg_pass;
 
@@ -6434,6 +6444,10 @@ SOKOL_GFX_API_DECL const void* sg_wgpu_device(void);
 SOKOL_GFX_API_DECL const void* sg_wgpu_queue(void);
 // WebGPU: return this frame's WGPUCommandEncoder
 SOKOL_GFX_API_DECL const void* sg_wgpu_command_encoder(void);
+// Sulrim: arm before the first pass. Caller owns the query set through GPU completion.
+// Query 0 is the first pass start; each pass ends at its end_query or query 1.
+SOKOL_GFX_API_DECL void sg_wgpu_arm_frame_timestamps(const void* query_set);
+SOKOL_GFX_API_DECL uint32_t sg_wgpu_frame_timestamp_passes(void);
 // WebGPU: return WGPURenderPassEncoder of current pass (returns 0 when outside pass or in a compute pass)
 SOKOL_GFX_API_DECL const void* sg_wgpu_render_pass_encoder(void);
 // WebGPU: return WGPUComputePassEncoder of current pass (returns 0 when outside pass or in a render pass)
@@ -7946,6 +7960,7 @@ typedef struct {
     id<MTLComputeCommandEncoder> compute_cmd_encoder;
     id<MTLBlitCommandEncoder> blit_cmd_encoder;
     id<CAMetalDrawable> cur_drawable;
+    id<CAMetalDrawable> deferred_drawable;
     id<MTLBuffer> uniform_buffers[SG_NUM_INFLIGHT_FRAMES];
     _sg_mtl_async_t* async;
     dispatch_group_t async_group;
@@ -8151,6 +8166,9 @@ typedef struct {
     WGPUCommandEncoder cmd_enc;
     WGPURenderPassEncoder rpass_enc;
     WGPUComputePassEncoder cpass_enc;
+    WGPUQuerySet timestamp_query;
+    uint32_t timestamp_passes;
+    bool pass_started;
     _sg_wgpu_uniform_system_t uniform;
     _sg_wgpu_bindings_cache_t bindings_cache;
     struct {
@@ -18334,7 +18352,15 @@ _SOKOL_PRIVATE void _sg_mtl_begin_compute_pass(const sg_pass* pass) {
     SOKOL_ASSERT(nil == _sg.mtl.compute_cmd_encoder);
     SOKOL_ASSERT(nil == _sg.mtl.render_cmd_encoder);
 
-    _sg.mtl.compute_cmd_encoder = [_sg.mtl.cmd_buffer computeCommandEncoder];
+    if (pass->metal.sample_buffer) {
+        MTLComputePassDescriptor* desc = [MTLComputePassDescriptor computePassDescriptor];
+        desc.sampleBufferAttachments[0].sampleBuffer = (__bridge id<MTLCounterSampleBuffer>)pass->metal.sample_buffer;
+        desc.sampleBufferAttachments[0].startOfEncoderSampleIndex = pass->metal.sample_index;
+        desc.sampleBufferAttachments[0].endOfEncoderSampleIndex = pass->metal.sample_index + 1;
+        _sg.mtl.compute_cmd_encoder = [_sg.mtl.cmd_buffer computeCommandEncoderWithDescriptor:desc];
+    } else {
+        _sg.mtl.compute_cmd_encoder = [_sg.mtl.cmd_buffer computeCommandEncoder];
+    }
     if (nil == _sg.mtl.compute_cmd_encoder) {
         _sg.cur_pass.valid = false;
         return;
@@ -18358,6 +18384,14 @@ _SOKOL_PRIVATE void _sg_mtl_begin_render_pass(const sg_pass* pass, const _sg_att
 
     MTLRenderPassDescriptor* pass_desc = [MTLRenderPassDescriptor renderPassDescriptor];
     SOKOL_ASSERT(pass_desc);
+    if (pass->metal.sample_buffer) {
+        MTLRenderPassSampleBufferAttachmentDescriptor* sample = pass_desc.sampleBufferAttachments[0];
+        sample.sampleBuffer = (__bridge id<MTLCounterSampleBuffer>)pass->metal.sample_buffer;
+        sample.startOfVertexSampleIndex = pass->metal.sample_index;
+        sample.endOfVertexSampleIndex = pass->metal.sample_index + 1;
+        sample.startOfFragmentSampleIndex = pass->metal.sample_index + 2;
+        sample.endOfFragmentSampleIndex = pass->metal.sample_index + 3;
+    }
     if (!atts->empty) {
         // setup pass descriptor for offscreen rendering
         for (NSUInteger i = 0; i < (NSUInteger)atts->num_color_views; i++) {
@@ -18457,13 +18491,18 @@ _SOKOL_PRIVATE void _sg_mtl_begin_render_pass(const sg_pass* pass, const _sg_att
         _sg_mtl_release_resource(_sg.frame_index, pass_desc_ref);
 
         _sg.mtl.cur_drawable = (__bridge id<CAMetalDrawable>) swapchain->metal.current_drawable;
+        if (pass->metal.defer_present) {
+            SOKOL_ASSERT(!_sg.mtl.deferred_drawable || _sg.mtl.deferred_drawable == _sg.mtl.cur_drawable);
+            _sg.mtl.deferred_drawable = _sg.mtl.cur_drawable;
+        }
         if (swapchain->sample_count > 1) {
             // multi-sampling: render into msaa texture, resolve into drawable texture
             id<MTLTexture> msaa_tex = (__bridge id<MTLTexture>) swapchain->metal.msaa_color_texture;
             SOKOL_ASSERT(msaa_tex != nil);
             pass_desc.colorAttachments[0].texture = msaa_tex;
             pass_desc.colorAttachments[0].resolveTexture = _sg.mtl.cur_drawable.texture;
-            pass_desc.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+            pass_desc.colorAttachments[0].storeAction = pass->metal.defer_present
+                ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionMultisampleResolve;
         } else {
             // non-msaa: render into current_drawable
             pass_desc.colorAttachments[0].texture = _sg.mtl.cur_drawable.texture;
@@ -18478,12 +18517,14 @@ _SOKOL_PRIVATE void _sg_mtl_begin_render_pass(const sg_pass* pass, const _sg_att
             id<MTLTexture> ds_tex = (__bridge id<MTLTexture>) swapchain->metal.depth_stencil_texture;
             SOKOL_ASSERT(ds_tex != nil);
             pass_desc.depthAttachment.texture = ds_tex;
-            pass_desc.depthAttachment.storeAction = MTLStoreActionDontCare;
+            pass_desc.depthAttachment.storeAction = pass->metal.defer_present
+                ? _sg_mtl_store_action(action->depth.store_action, false) : MTLStoreActionDontCare;
             pass_desc.depthAttachment.loadAction = _sg_mtl_load_action(action->depth.load_action);
             pass_desc.depthAttachment.clearDepth = action->depth.clear_value;
             if (_sg_is_depth_stencil_format(swapchain->depth_format)) {
                 pass_desc.stencilAttachment.texture = ds_tex;
-                pass_desc.stencilAttachment.storeAction = MTLStoreActionDontCare;
+                pass_desc.stencilAttachment.storeAction = pass->metal.defer_present
+                    ? _sg_mtl_store_action(action->stencil.store_action, false) : MTLStoreActionDontCare;
                 pass_desc.stencilAttachment.loadAction = _sg_mtl_load_action(action->stencil.load_action);
                 pass_desc.stencilAttachment.clearStencil = action->stencil.clear_value;
             }
@@ -18584,7 +18625,9 @@ _SOKOL_PRIVATE void _sg_mtl_end_pass(const _sg_attachments_ptrs_t* atts) {
     }
     // if this is a swapchain pass, present the drawable
     if (nil != _sg.mtl.cur_drawable) {
-        [_sg.mtl.cmd_buffer presentDrawable:_sg.mtl.cur_drawable];
+        if (_sg.mtl.cur_drawable != _sg.mtl.deferred_drawable) {
+            [_sg.mtl.cmd_buffer presentDrawable:_sg.mtl.cur_drawable];
+        }
         _sg.mtl.cur_drawable = nil;
     }
 }
@@ -18597,6 +18640,10 @@ _SOKOL_PRIVATE void _sg_mtl_commit(void) {
 
     // commit the frame's command buffer
     if (_sg.mtl.cmd_buffer) {
+        if (_sg.mtl.deferred_drawable) {
+            [_sg.mtl.cmd_buffer presentDrawable:_sg.mtl.deferred_drawable];
+            _sg.mtl.deferred_drawable = nil;
+        }
         [_sg.mtl.cmd_buffer commit];
     }
 
@@ -21547,9 +21594,23 @@ _SOKOL_PRIVATE void _sg_wgpu_init_ds_att(WGPURenderPassDepthStencilAttachment* w
     wgpu_att->stencilReadOnly = false;
 }
 
+_SOKOL_PRIVATE WGPUPassTimestampWrites _sg_wgpu_pass_timestamps(const sg_pass* pass) {
+    WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+    writes.querySet = _sg.wgpu.timestamp_query;
+    if (writes.querySet) {
+        if (_sg.wgpu.timestamp_passes++ == 0) {
+            writes.beginningOfPassWriteIndex = 0;
+        }
+        writes.endOfPassWriteIndex = pass->wgpu.end_query ? pass->wgpu.end_query : 1;
+    }
+    return writes;
+}
+
 _SOKOL_PRIVATE void _sg_wgpu_begin_compute_pass(const sg_pass* pass) {
     _SG_STRUCT(WGPUComputePassDescriptor, wgpu_pass_desc);
     wgpu_pass_desc.label = _sg_wgpu_stringview(pass->label);
+    WGPUPassTimestampWrites timestamps = _sg_wgpu_pass_timestamps(pass);
+    wgpu_pass_desc.timestampWrites = timestamps.querySet ? &timestamps : 0;
     _sg.wgpu.cpass_enc = wgpuCommandEncoderBeginComputePass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
     SOKOL_ASSERT(_sg.wgpu.cpass_enc);
     // Fresh encoders have no bindings. Pipeline application supplies non-null empty groups.
@@ -21601,6 +21662,8 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_render_pass(const sg_pass* pass, const _sg_at
             wgpu_pass_desc.depthStencilAttachment = &wgpu_ds_att;
         }
     }
+    WGPUPassTimestampWrites timestamps = _sg_wgpu_pass_timestamps(pass);
+    wgpu_pass_desc.timestampWrites = timestamps.querySet ? &timestamps : 0;
     _sg.wgpu.rpass_enc = wgpuCommandEncoderBeginRenderPass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
     SOKOL_ASSERT(_sg.wgpu.rpass_enc);
 
@@ -21623,6 +21686,7 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_pass(const sg_pass* pass, const _sg_attachmen
 
     _sg_wgpu_acquire_command_encoder();
     _sg_wgpu_reset_state_cache();
+    _sg.wgpu.pass_started = true;
     if (pass->compute) {
         _sg_wgpu_begin_compute_pass(pass);
     } else {
@@ -21645,6 +21709,9 @@ _SOKOL_PRIVATE void _sg_wgpu_end_pass(const _sg_attachments_ptrs_t* atts) {
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_commit(void) {
+    _sg.wgpu.timestamp_query = 0;
+    _sg.wgpu.timestamp_passes = 0;
+    _sg.wgpu.pass_started = false;
     _sg_wgpu_async_drain();
     if (!_sg.wgpu.cmd_enc) {
         // Service submitted or never-encoded retirements even without a pass.
@@ -31088,6 +31155,27 @@ SOKOL_API_IMPL const void* sg_wgpu_queue(void) {
 SOKOL_API_IMPL const void* sg_wgpu_command_encoder(void) {
     #if defined(SOKOL_WGPU)
         return (const void*) _sg.wgpu.cmd_enc;
+    #else
+        return 0;
+    #endif
+}
+
+SOKOL_API_IMPL void sg_wgpu_arm_frame_timestamps(const void* query_set) {
+    SOKOL_ASSERT(_sg.valid && !_sg.cur_pass.in_pass);
+    #if defined(SOKOL_WGPU)
+        SOKOL_ASSERT(!_sg.wgpu.pass_started);
+        SOKOL_ASSERT(!query_set || wgpuDeviceHasFeature(_sg.wgpu.dev, WGPUFeatureName_TimestampQuery));
+        _sg.wgpu.timestamp_query = (WGPUQuerySet)query_set;
+        _sg.wgpu.timestamp_passes = 0;
+    #else
+        SOKOL_ASSERT(!query_set);
+        _SOKOL_UNUSED(query_set);
+    #endif
+}
+
+SOKOL_API_IMPL uint32_t sg_wgpu_frame_timestamp_passes(void) {
+    #if defined(SOKOL_WGPU)
+        return _sg.wgpu.timestamp_passes;
     #else
         return 0;
     #endif

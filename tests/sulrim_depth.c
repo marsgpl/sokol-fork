@@ -197,5 +197,6 @@ int main(void) {
         probe_shutdown();
         printf("Metal depth: %llu exact pixels, sync/async invariant EQUAL passes PASS\n", (unsigned long long)pixels_checked);
     }
+    return 0;
 }
 #endif

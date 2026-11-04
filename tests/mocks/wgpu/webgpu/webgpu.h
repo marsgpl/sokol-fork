@@ -59,7 +59,14 @@ typedef struct WGPUShaderModuleImpl* WGPUShaderModule;
 typedef struct WGPUTextureImpl* WGPUTexture;
 typedef struct WGPUTextureViewImpl* WGPUTextureView;
 typedef struct WGPUQuerySetImpl* WGPUQuerySet;
-typedef struct WGPUPassTimestampWrites WGPUPassTimestampWrites;
+typedef struct WGPUPassTimestampWrites {
+    struct WGPUChainedStruct* nextInChain;
+    WGPUQuerySet querySet;
+    uint32_t beginningOfPassWriteIndex;
+    uint32_t endOfPassWriteIndex;
+} WGPUPassTimestampWrites;
+#define WGPU_QUERY_SET_INDEX_UNDEFINED UINT32_MAX
+#define WGPU_PASS_TIMESTAMP_WRITES_INIT {NULL, NULL, WGPU_QUERY_SET_INDEX_UNDEFINED, WGPU_QUERY_SET_INDEX_UNDEFINED}
 typedef struct WGPUConstantEntry WGPUConstantEntry;
 
 // enums
