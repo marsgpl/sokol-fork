@@ -36,6 +36,7 @@ WGPUStatus wgpuBufferWriteMappedRange(WGPUBuffer b, size_t offset, const void* d
 void wgpuBufferUnmap(WGPUBuffer b) { CHECK(b == buffer); unmaps++; }
 
 int main(void) {
+    _sg.stats_enabled = true;
         for (size_t size = 1; size <= 129; size++) {
             uint8_t* src = malloc(size);
             CHECK(src);
@@ -48,6 +49,7 @@ int main(void) {
                 _sg_buffer_t b = { 0 };
                 _sg_buffer_common_init(&b.cmn, &desc);
                 mappings = writes = unmaps = 0;
+                _sg.stats.cur_frame.wgpu.transfers.size_memcpy = 0;
                 CHECK(_sg_wgpu_create_buffer(&b, &desc) == SG_RESOURCESTATE_VALID);
                 CHECK(created.mappedAtCreation && created.size == ((size + 3) & ~(size_t)3));
                 CHECK(!(created.usage & WGPUBufferUsage_CopyDst));
@@ -55,8 +57,10 @@ int main(void) {
                 for (size_t i = size; i < created.size; i++) { CHECK(bytes[i] == 0); }
                 #if defined(__EMSCRIPTEN__)
                 CHECK(mappings == 0 && writes == ((size > 7 && size % 4) ? 2 : 1));
+                CHECK(_sg.stats.cur_frame.wgpu.transfers.size_memcpy == ((size & 3) ? (size & 7) : 0));
                 #else
                 CHECK(mappings == 1 && writes == 0);
+                CHECK(_sg.stats.cur_frame.wgpu.transfers.size_memcpy == size);
                 #endif
             }
             free(src);

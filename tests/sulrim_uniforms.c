@@ -23,6 +23,10 @@ static unsigned traces;
 static id<MTLCommandBuffer> frame_command;
 #endif
 static float red[600], green[600];
+EXPORT void probe_profile(int mode) {
+    if (mode == 3) sg_disable_stats(); else sg_enable_stats();
+    sg_wgpu_profile_uniforms(mode == 1);
+}
 static void logger(const char* tag, uint32_t level, uint32_t item, const char* message, uint32_t line, const char* file, void* data) {
     (void)tag; (void)item; (void)file; (void)data;
     if (level <= 1) { fprintf(stderr, "%u: %s\n", line, message ? message : "error"); abort(); }
@@ -106,8 +110,26 @@ EXPORT void probe_render(void) {
 #endif
     sg_commit();
     sg_frame_stats stats = sg_query_stats().prev_frame;
-    CHECK(stats.num_apply_uniforms == 8 && stats.num_apply_uniforms_cached == 7);
-    CHECK(stats.num_reuse_uniforms == 5 && stats.size_reuse_uniforms == 5*sizeof red);
+    if (sg_stats_enabled()) {
+        CHECK(stats.num_apply_uniforms == 8 && stats.num_apply_uniforms_cached == 7);
+        CHECK(stats.num_reuse_uniforms == 5 && stats.size_reuse_uniforms == 5*sizeof red);
+#if defined(SOKOL_METAL)
+        CHECK(stats.metal.uniforms.size_used == 3u*(uint32_t)_sg_roundup_pow2(sizeof red, _SG_MTL_UB_ALIGN));
+#else
+        CHECK(stats.wgpu.uniforms.size_copy == 3*sizeof red && stats.wgpu.uniforms.num_set_bindgroup == 8);
+        CHECK(stats.wgpu.uniforms.size_write_buffer == 3*_sg_roundup_pow2_u32(sizeof red, _sg.wgpu.limits.minUniformBufferOffsetAlignment));
+#endif
+    } else CHECK(!stats.num_apply_uniforms && !stats.wgpu.uniforms.size_hash);
+#if defined(SOKOL_WGPU)
+    const bool profiled = sg_stats_enabled() && _sg.wgpu.uniform.profiled;
+    CHECK(stats.wgpu.uniforms.size_hash == (profiled ? 3*sizeof red : 0));
+    CHECK(stats.wgpu.uniforms.num_unique == (profiled ? 2u : 0u) && stats.wgpu.uniforms.size_unique == (profiled ? 2*sizeof red : 0));
+    CHECK(profiled ? stats.wgpu.uniforms.size_compare > 0 : !stats.wgpu.uniforms.size_compare);
+    CHECK(!_sg.wgpu.uniform.num_records);
+    CHECK(!_sg.wgpu.uniform.profiled || _sg.wgpu.uniform.records || !sg_stats_enabled());
+#else
+    CHECK(!sg_query_stats().wgpu_memory.uniform_gpu_bytes);
+#endif
 }
 EXPORT void probe_shutdown(void) {
     sg_destroy_view(color); sg_destroy_image(image);
@@ -116,6 +138,37 @@ EXPORT void probe_shutdown(void) {
     sg_shutdown();
 }
 #if defined(SOKOL_WGPU)
+EXPORT double probe_native_count(int key) {
+    const sg_frame_stats_wgpu s = sg_query_stats().prev_frame.wgpu;
+    const double values[] = {s.num_begin_render_pass, s.num_begin_compute_pass, s.num_set_pipeline,
+        s.uniforms.num_set_bindgroup, s.bindings.num_set_bindgroup, s.transfers.num_write_buffer,
+        (double)s.transfers.size_write_buffer, s.transfers.num_queue_submit, s.bindings.num_create_bindgroup,
+        s.transfers.num_write_texture, (double)s.transfers.size_write_texture,
+        s.transfers.num_copy_buffer, (double)s.transfers.size_copy_buffer};
+    CHECK(key >= 0 && key < (int)(sizeof values/sizeof *values)); return values[key];
+}
+static sg_buffer transfer_buffers[4];
+static sg_image transfer_image;
+EXPORT void probe_transfers(void) {
+    const uint8_t bytes[20] = {1,2,3,4,5,6,7,0,9,10,11,12,13,14,15,16,17,18,19,20};
+    transfer_buffers[0] = sg_make_buffer(&(sg_buffer_desc){.size = 8, .usage = {.index_buffer = true, .write_transient = true}});
+    transfer_buffers[1] = sg_make_buffer(&(sg_buffer_desc){.size = 8, .usage = {.staging_index_buffer = true, .copy_src = true, .write_transient = true}});
+    transfer_buffers[2] = sg_make_buffer(&(sg_buffer_desc){.size = 8, .usage = {.index_buffer = true, .copy_dst = true, .copy_src = true}});
+    transfer_buffers[3] = sg_make_buffer(&(sg_buffer_desc){.size = 8, .usage = {.index_buffer = true, .copy_dst = true, .copy_src = true}});
+    sg_write_buffer_transient(&(sg_write_buffer_desc){.dst.buffer = transfer_buffers[0], .src.data = {bytes,7}});
+    sg_write_buffer_transient(&(sg_write_buffer_desc){.dst.buffer = transfer_buffers[1], .src.data = {bytes,7}});
+    sg_copy_buffer_to_buffer(&(sg_copy_buffer_to_buffer_desc){.src.buffer = transfer_buffers[1], .dst.buffer = transfer_buffers[2], .size = 7});
+    sg_copy_buffer_to_buffer(&(sg_copy_buffer_to_buffer_desc){.src.buffer = transfer_buffers[2], .dst.buffer = transfer_buffers[3], .size = 7});
+    transfer_image = sg_make_image(&(sg_image_desc){.width = 2, .height = 2, .num_mipmaps = 2, .usage.copy_src = true, .data = SG_RANGE(bytes)});
+    sg_commit();
+    const sg_frame_stats_transfers s = sg_query_stats().prev_frame.wgpu.transfers;
+    CHECK(s.size_memcpy == 13 && s.size_write_padding == 2 && s.size_write_buffer == 16 && s.size_write_texture == 40 && s.size_copy_buffer == 8);
+}
+EXPORT uintptr_t probe_transfer_buffer(void) {return (uintptr_t)sg_wgpu_query_buffer_info(transfer_buffers[3]).buf;}
+EXPORT uintptr_t probe_transfer_image(void) {return (uintptr_t)sg_wgpu_query_image_info(transfer_image).tex;}
+EXPORT void probe_transfer_cleanup(void) {
+    for (int i = 0; i < 4; i++) sg_destroy_buffer(transfer_buffers[i]); sg_destroy_image(transfer_image);
+}
 EXPORT void probe_bad_layout(void) {
     sg_shader shader = sg_make_shader(&(sg_shader_desc){
         .vertex_func = {.source = fragment_source, .entry = "vs"}, .fragment_func = {.source = fragment_source, .entry = "fs"},
@@ -171,6 +224,7 @@ int main(void) {
         id<MTLDevice> device = (__bridge id<MTLDevice>)sg_query_desc().environment.metal.device;
         unsigned pixels = 0;
         for (int frame = 0; frame < SG_NUM_INFLIGHT_FRAMES+2; frame++) {
+            probe_profile(frame);
             probe_render(); [frame_command waitUntilCompleted]; CHECK(frame_command.status == MTLCommandBufferStatusCompleted);
 #if !__has_feature(objc_arc)
             [frame_command release];

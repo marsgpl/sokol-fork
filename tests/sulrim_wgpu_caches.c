@@ -223,4 +223,4 @@ static void render_state(void) {
     for (int i = 0; i < 4; i++) sg_destroy_pipeline(pipelines[i]);
     sg_destroy_shader(shader); shutdown();
 }
-int main(void) { uniforms(); resources(); empty_groups(false); empty_groups(true); render_state(); puts("cache mocks: uniform sizes/identity, LRU/lifetimes, empty groups and dynamic state pass"); }
+int main(void) { uniforms(); resources(); empty_groups(false); empty_groups(true); render_state(); puts("cache mocks: uniform sizes/identity, LRU/lifetimes, empty groups and dynamic state pass"); return 0; }

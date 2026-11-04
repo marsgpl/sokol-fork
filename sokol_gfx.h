@@ -5058,6 +5058,7 @@ typedef struct sg_frame_stats_metal_bindings {
 } sg_frame_stats_metal_bindings;
 
 typedef struct sg_frame_stats_metal_uniforms {
+    uint32_t size_used; // aligned ring offset at commit
     uint32_t num_set_vertex_buffer_offset;
     uint32_t num_set_fragment_buffer_offset;
     uint32_t num_set_compute_buffer_offset;
@@ -5073,6 +5074,11 @@ typedef struct sg_frame_stats_metal {
 typedef struct sg_frame_stats_wgpu_uniforms {
     uint32_t num_set_bindgroup;
     uint32_t size_write_buffer;
+    uint32_t size_copy; // payload copied into the ring, before alignment
+    uint32_t num_unique; // copied payloads per shader lifetime and slot within this commit
+    uint32_t size_unique;
+    uint32_t size_hash; // profiling work, without changing uploads
+    uint64_t size_compare;
 } sg_frame_stats_wgpu_uniforms;
 
 typedef struct sg_frame_stats_wgpu_bindings {
@@ -5091,9 +5097,26 @@ typedef struct sg_frame_stats_wgpu_bindings {
     uint32_t num_bindgroup_cache_hash_vs_key_mismatch;
 } sg_frame_stats_wgpu_bindings;
 
+// Native queue traffic and explicit CPU copies; helper traffic stays separate.
+typedef struct sg_frame_stats_transfers {
+    uint32_t num_write_buffer;
+    uint32_t num_write_texture;
+    uint32_t num_copy_buffer;
+    uint32_t num_queue_submit;
+    uint64_t size_write_buffer;
+    uint64_t size_write_texture;
+    uint64_t size_write_padding;
+    uint64_t size_copy_buffer;
+    uint64_t size_memcpy;
+} sg_frame_stats_transfers;
+
 typedef struct sg_frame_stats_wgpu {
+    uint32_t num_begin_render_pass;
+    uint32_t num_begin_compute_pass;
+    uint32_t num_set_pipeline;
     uint32_t num_set_blend_constant;
     uint32_t num_set_stencil_reference;
+    sg_frame_stats_transfers transfers;
     sg_frame_stats_wgpu_uniforms uniforms;
     sg_frame_stats_wgpu_bindings bindings;
 } sg_frame_stats_wgpu;
@@ -5176,6 +5199,7 @@ typedef struct sg_frame_stats {
     sg_frame_resource_stats shaders;
     sg_frame_resource_stats pipelines;
 
+    sg_frame_stats_transfers external_transfers;
     sg_frame_stats_gl gl;
     sg_frame_stats_d3d11 d3d11;
     sg_frame_stats_metal metal;
@@ -5183,8 +5207,14 @@ typedef struct sg_frame_stats {
     sg_frame_stats_vk vk;
 } sg_frame_stats;
 
-// Owned-resource retirement is independent of frame-stat collection.
+// Known capacities exclude opaque native/driver objects; independent of frame stats.
 typedef struct sg_wgpu_memory_stats {
+    uint64_t uniform_gpu_bytes;
+    uint64_t uniform_staging_bytes;
+    uint64_t uniform_profiling_bytes;
+    uint64_t bindgroup_cache_bytes;
+    uint32_t bindgroups_alive;
+    uint32_t bindgroups_capacity;
     uint64_t retirement_queue_bytes;
     uint64_t retired_buffer_bytes;
     uint64_t retired_image_bytes;
@@ -6278,6 +6308,8 @@ SOKOL_GFX_API_DECL void sg_enable_stats(void);
 SOKOL_GFX_API_DECL void sg_disable_stats(void);
 SOKOL_GFX_API_DECL bool sg_stats_enabled(void);
 SOKOL_GFX_API_DECL sg_stats sg_query_stats(void);
+// Renderer-thread helper traffic joins the current frame only while stats are enabled.
+SOKOL_GFX_API_DECL void sg_add_transfer_stats(const sg_frame_stats_transfers* stats);
 
 /* Backend-specific structs and functions, these may come in handy for mixing
    sokol-gfx rendering with 'native backend' rendering functions.
@@ -6448,6 +6480,8 @@ SOKOL_GFX_API_DECL const void* sg_wgpu_command_encoder(void);
 // Query 0 is the first pass start; each pass ends at its end_query or query 1.
 SOKOL_GFX_API_DECL void sg_wgpu_arm_frame_timestamps(const void* query_set);
 SOKOL_GFX_API_DECL uint32_t sg_wgpu_frame_timestamp_passes(void);
+// Hash/sort copied payloads for unique stats. Off by default, needs stats; set before the first apply.
+SOKOL_GFX_API_DECL void sg_wgpu_profile_uniforms(bool enabled);
 // WebGPU: return WGPURenderPassEncoder of current pass (returns 0 when outside pass or in a compute pass)
 SOKOL_GFX_API_DECL const void* sg_wgpu_render_pass_encoder(void);
 // WebGPU: return WGPUComputePassEncoder of current pass (returns 0 when outside pass or in a render pass)
@@ -8061,12 +8095,25 @@ typedef struct _sg_view_s {
 } _sg_wgpu_view_t;
 typedef _sg_wgpu_view_t _sg_view_t;
 
+// References into the existing staging ring; no second payload copy.
+typedef struct {
+    uint64_t shader;
+    uint64_t hash;
+    uint32_t slot;
+    uint32_t size;
+    uint32_t offset;
+} _sg_wgpu_uniform_record_t;
+
 // a pool of per-frame uniform buffers
 typedef struct {
     uint32_t num_bytes;
     uint32_t offset;    // current offset into buf
     uint8_t* staging;   // intermediate buffer for uniform data updates
     WGPUBuffer buf;     // the GPU-side uniform buffer
+    _sg_wgpu_uniform_record_t* records;
+    uint32_t num_records;
+    uint32_t max_records;
+    bool profiled;
     bool dirty;
     uint32_t bind_offsets[SG_MAX_UNIFORMBLOCK_BINDSLOTS];   // NOTE: index is sokol-gfx ub slot index!
 } _sg_wgpu_uniform_system_t;
@@ -18654,6 +18701,7 @@ _SOKOL_PRIVATE void _sg_mtl_commit(void) {
     if (++_sg.mtl.cur_frame_rotate_index >= SG_NUM_INFLIGHT_FRAMES) {
         _sg.mtl.cur_frame_rotate_index = 0;
     }
+    _sg_stats_add(metal.uniforms.size_used, (uint32_t)_sg.mtl.cur_ub_offset);
     _sg.mtl.cur_ub_offset = 0;
     _sg.mtl.cur_ub_base_ptr = 0;
     // NOTE: MTLCommandBuffer is autoreleased
@@ -19938,11 +19986,18 @@ _SOKOL_PRIVATE void _sg_wgpu_uniform_system_discard(void) {
         _sg_free(_sg.wgpu.uniform.staging);
         _sg.wgpu.uniform.staging = 0;
     }
+    if (_sg.wgpu.uniform.records) {
+        _sg_free(_sg.wgpu.uniform.records);
+        _sg.wgpu.uniform.records = 0;
+    }
+    _sg.wgpu.uniform.num_records = 0;
+    _sg.wgpu.uniform.max_records = 0;
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_set_bindgroup(void) {
     SOKOL_ASSERT(_sg.wgpu.uniform.dirty);
     _sg.wgpu.uniform.dirty = false;
+    _sg_stats_inc(wgpu.uniforms.num_set_bindgroup);
     const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
     // NOTE: dynamic offsets must be in binding order, not in BindGroupEntry order
@@ -19978,8 +20033,62 @@ _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_apply_pipeline(void) {
     _sg.wgpu.uniform.dirty = true;
 }
 
+_SOKOL_PRIVATE uint64_t _sg_wgpu_hash(const void* key, int len, uint64_t seed);
+
+_SOKOL_PRIVATE void _sg_wgpu_uniform_stats_record(int ub_slot, uint32_t size) {
+    if (!_sg.stats_enabled || !_sg.wgpu.uniform.profiled) {
+        return;
+    }
+    _sg_wgpu_uniform_system_t* u = &_sg.wgpu.uniform;
+    const uint32_t alignment = _sg.wgpu.limits.minUniformBufferOffsetAlignment;
+    SOKOL_ASSERT(size > 0 && alignment > 0);
+    if (!u->records) {
+        u->max_records = (u->num_bytes - 1) / alignment + 1;
+        u->records = (_sg_wgpu_uniform_record_t*)_sg_malloc((size_t)u->max_records * sizeof(*u->records));
+        SOKOL_ASSERT(u->records);
+    }
+    SOKOL_ASSERT(u->num_records < u->max_records);
+    const _sg_pipeline_t* pip = _sg_pipeline_ref_ptr(&_sg.cur_pip);
+    const _sg_shader_t* shd = _sg_shader_ref_ptr(&pip->cmn.shader);
+    _sg_wgpu_uniform_record_t* rec = &u->records[u->num_records++];
+    rec->shader = ((uint64_t)shd->slot.uninit_count << 32) | shd->slot.id;
+    rec->hash = _sg_wgpu_hash(u->staging + u->offset, (int)size, 0x1234567887654321);
+    rec->slot = (uint32_t)ub_slot;
+    rec->size = size;
+    rec->offset = u->offset;
+    _sg_stats_add(wgpu.uniforms.size_hash, size);
+}
+
+_SOKOL_PRIVATE int _sg_wgpu_uniform_stats_compare(const void* lhs, const void* rhs) {
+    const _sg_wgpu_uniform_record_t* a = (const _sg_wgpu_uniform_record_t*)lhs;
+    const _sg_wgpu_uniform_record_t* b = (const _sg_wgpu_uniform_record_t*)rhs;
+    if (a->shader != b->shader) { return a->shader < b->shader ? -1 : 1; }
+    if (a->slot != b->slot) { return a->slot < b->slot ? -1 : 1; }
+    if (a->size != b->size) { return a->size < b->size ? -1 : 1; }
+    if (a->hash != b->hash) { return a->hash < b->hash ? -1 : 1; }
+    _sg_stats_add(wgpu.uniforms.size_compare, a->size);
+    return memcmp(_sg.wgpu.uniform.staging + a->offset, _sg.wgpu.uniform.staging + b->offset, a->size);
+}
+
+_SOKOL_PRIVATE void _sg_wgpu_uniform_stats_finish(void) {
+    _sg_wgpu_uniform_system_t* u = &_sg.wgpu.uniform;
+    if (_sg.stats_enabled && u->num_records > 0) {
+        qsort(u->records, u->num_records, sizeof(*u->records), _sg_wgpu_uniform_stats_compare);
+        for (uint32_t i = 0; i < u->num_records; ++i) {
+            if (i == 0 || _sg_wgpu_uniform_stats_compare(&u->records[i-1], &u->records[i]) != 0) {
+                _sg_stats_inc(wgpu.uniforms.num_unique);
+                _sg_stats_add(wgpu.uniforms.size_unique, u->records[i].size);
+            }
+        }
+    }
+    u->num_records = 0;
+}
+
 _SOKOL_PRIVATE void _sg_wgpu_uniform_system_on_commit(void) {
+    _sg_wgpu_uniform_stats_finish();
     wgpuQueueWriteBuffer(_sg.wgpu.queue, _sg.wgpu.uniform.buf, 0, _sg.wgpu.uniform.staging, _sg.wgpu.uniform.offset);
+    _sg_stats_inc(wgpu.transfers.num_write_buffer);
+    _sg_stats_add(wgpu.transfers.size_write_buffer, _sg.wgpu.uniform.offset);
     _sg_stats_add(wgpu.uniforms.size_write_buffer, _sg.wgpu.uniform.offset);
     _sg.wgpu.uniform.offset = 0;
     _sg_clear(_sg.wgpu.uniform.bind_offsets, sizeof(_sg.wgpu.uniform.bind_offsets));
@@ -20155,7 +20264,6 @@ _SOKOL_PRIVATE _sg_wgpu_bindgroup_t* _sg_wgpu_create_bindgroup(_sg_bindings_ptrs
     SOKOL_ASSERT(_sg.wgpu.dev);
     SOKOL_ASSERT(bnd->pip);
     const _sg_shader_t* shd = _sg_shader_ref_ptr(&bnd->pip->cmn.shader);
-    _sg_stats_inc(wgpu.bindings.num_create_bindgroup);
     _sg_wgpu_bindgroup_handle_t bg_id = _sg_wgpu_alloc_bindgroup();
     if (bg_id.id == SG_INVALID_ID) {
         return 0;
@@ -20206,6 +20314,7 @@ _SOKOL_PRIVATE _sg_wgpu_bindgroup_t* _sg_wgpu_create_bindgroup(_sg_bindings_ptrs
     bg_desc.entryCount = bgl_index;
     bg_desc.entries = bg_entries;
     bg->bindgroup = wgpuDeviceCreateBindGroup(_sg.wgpu.dev, &bg_desc);
+    _sg_stats_inc(wgpu.bindings.num_create_bindgroup);
     if (bg->bindgroup == 0) {
         _SG_ERROR(WGPU_CREATEBINDGROUP_FAILED);
         bg->slot.state = SG_RESOURCESTATE_FAILED;
@@ -20218,13 +20327,13 @@ _SOKOL_PRIVATE _sg_wgpu_bindgroup_t* _sg_wgpu_create_bindgroup(_sg_bindings_ptrs
 
 _SOKOL_PRIVATE void _sg_wgpu_discard_bindgroup(_sg_wgpu_bindgroup_t* bg) {
     SOKOL_ASSERT(bg);
-    _sg_stats_inc(wgpu.bindings.num_discard_bindgroup);
     if (_sg.wgpu.bindings_cache.bg.id == bg->slot.id) {
         _sg.wgpu.bindings_cache.bg.id = SG_INVALID_ID;
     }
     if ((bg->slot.state == SG_RESOURCESTATE_VALID) || (bg->slot.state == SG_RESOURCESTATE_FAILED)) {
         if (bg->bindgroup) {
             wgpuBindGroupRelease(bg->bindgroup);
+            _sg_stats_inc(wgpu.bindings.num_discard_bindgroup);
             bg->bindgroup = 0;
         }
         _sg_wgpu_reset_bindgroup_to_alloc_state(bg);
@@ -20772,6 +20881,7 @@ _SOKOL_PRIVATE WGPUStatus _sg_wgpu_write_initial_buffer(WGPUBuffer buffer, const
     if (tail_size > 0) {
         uint8_t tail[8] = { 0 };
         memcpy(tail, (const uint8_t*)data->ptr + prefix_size, tail_size);
+        _sg_stats_add(wgpu.transfers.size_memcpy, tail_size);
         return wgpuBufferWriteMappedRange(buffer, prefix_size, tail, (tail_size + 3) & ~(size_t)3);
     }
     return WGPUStatus_Success;
@@ -20813,6 +20923,7 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_buffer(_sg_buffer_t* buf, const
             void* ptr = wgpuBufferGetMappedRange(buf->wgpu.buf, 0, wgpu_buf_size);
             SOKOL_ASSERT(ptr);
             memcpy(ptr, desc->data.ptr, desc->data.size);
+            _sg_stats_add(wgpu.transfers.size_memcpy, desc->data.size);
             #endif
             wgpuBufferUnmap(buf->wgpu.buf);
             #if defined(__EMSCRIPTEN__)
@@ -20874,6 +20985,7 @@ _SOKOL_PRIVATE void _sg_wgpu_copy_buffer_data(const _sg_buffer_t* buf, uint64_t 
         SOKOL_ASSERT(buf->wgpu.staging_ptr);
         uint8_t* dst_ptr = buf->wgpu.staging_ptr + dst_offset;
         memcpy(dst_ptr, src_ptr, copy_size);
+        _sg_stats_add(wgpu.transfers.size_memcpy, copy_size);
     } else {
         SOKOL_ASSERT(buf->wgpu.buf);
         // WebGPU's write-buffer requires the size to be a multiple of four, so we may need to split the copy
@@ -20883,6 +20995,8 @@ _SOKOL_PRIVATE void _sg_wgpu_copy_buffer_data(const _sg_buffer_t* buf, uint64_t 
         uint64_t extra_size = copy_size & (uint64_t)3;
         SOKOL_ASSERT(extra_size < 4);
         wgpuQueueWriteBuffer(_sg.wgpu.queue, buf->wgpu.buf, dst_offset, src_ptr, clamped_size);
+        _sg_stats_inc(wgpu.transfers.num_write_buffer);
+        _sg_stats_add(wgpu.transfers.size_write_buffer, clamped_size);
         if (extra_size > 0) {
             const uint64_t extra_src_offset = clamped_size;
             const uint64_t extra_dst_offset = dst_offset + clamped_size;
@@ -20892,6 +21006,10 @@ _SOKOL_PRIVATE void _sg_wgpu_copy_buffer_data(const _sg_buffer_t* buf, uint64_t 
                 extra_data[i] = extra_src_ptr[i];
             }
             wgpuQueueWriteBuffer(_sg.wgpu.queue, buf->wgpu.buf, extra_dst_offset, extra_data, 4);
+            _sg_stats_inc(wgpu.transfers.num_write_buffer);
+            _sg_stats_add(wgpu.transfers.size_write_buffer, 4);
+            _sg_stats_add(wgpu.transfers.size_write_padding, 4 - extra_size);
+            _sg_stats_add(wgpu.transfers.size_memcpy, extra_size);
         }
     }
 }
@@ -20943,6 +21061,8 @@ _SOKOL_PRIVATE void _sg_wgpu_write_miplevel_data(const _sg_image_t* img,
     wgpu_extent.height = (uint32_t)_sg_roundup_pow2(height, block_dim);
     wgpu_extent.depthOrArrayLayers = (uint32_t)num_slices;
     wgpuQueueWriteTexture(_sg.wgpu.queue, &wgpu_copy_tex, (const void*)src_ptr, src_size, &wgpu_layout, &wgpu_extent);
+    _sg_stats_inc(wgpu.transfers.num_write_texture);
+    _sg_stats_add(wgpu.transfers.size_write_texture, src_size);
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_copy_image_data(const _sg_image_t* img, const sg_range* data) {
@@ -21238,6 +21358,7 @@ _SOKOL_PRIVATE sg_resource_state _sg_wgpu_create_shader(_sg_shader_t* shd, const
     bg_desc.entryCount = bgl_index;
     bg_desc.entries = bg_entries;
     shd->wgpu.bg_ub = wgpuDeviceCreateBindGroup(_sg.wgpu.dev, &bg_desc);
+    _sg_stats_inc(wgpu.bindings.num_create_bindgroup);
     SOKOL_ASSERT(shd->wgpu.bg_ub);
 
     // sort the dynoffset_map by wgpu bindings, this is because the
@@ -21328,10 +21449,12 @@ _SOKOL_PRIVATE void _sg_wgpu_discard_shader(_sg_shader_t* shd) {
     }
     if (shd->wgpu.bg_ub) {
         wgpuBindGroupRelease(shd->wgpu.bg_ub);
+        _sg_stats_inc(wgpu.bindings.num_discard_bindgroup);
         shd->wgpu.bg_ub = 0;
     }
     if (shd->wgpu.bg_view_smp_empty) {
         wgpuBindGroupRelease(shd->wgpu.bg_view_smp_empty);
+        _sg_stats_inc(wgpu.bindings.num_discard_bindgroup);
         shd->wgpu.bg_view_smp_empty = 0;
     }
     if (shd->wgpu.bgl_view_smp) {
@@ -21612,6 +21735,7 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_compute_pass(const sg_pass* pass) {
     WGPUPassTimestampWrites timestamps = _sg_wgpu_pass_timestamps(pass);
     wgpu_pass_desc.timestampWrites = timestamps.querySet ? &timestamps : 0;
     _sg.wgpu.cpass_enc = wgpuCommandEncoderBeginComputePass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
+    _sg_stats_inc(wgpu.num_begin_compute_pass);
     SOKOL_ASSERT(_sg.wgpu.cpass_enc);
     // Fresh encoders have no bindings. Pipeline application supplies non-null empty groups.
 }
@@ -21665,6 +21789,7 @@ _SOKOL_PRIVATE void _sg_wgpu_begin_render_pass(const sg_pass* pass, const _sg_at
     WGPUPassTimestampWrites timestamps = _sg_wgpu_pass_timestamps(pass);
     wgpu_pass_desc.timestampWrites = timestamps.querySet ? &timestamps : 0;
     _sg.wgpu.rpass_enc = wgpuCommandEncoderBeginRenderPass(_sg.wgpu.cmd_enc, &wgpu_pass_desc);
+    _sg_stats_inc(wgpu.num_begin_render_pass);
     SOKOL_ASSERT(_sg.wgpu.rpass_enc);
 
     // Fresh encoders have no bindings. Pipeline application supplies non-null empty groups.
@@ -21725,6 +21850,7 @@ _SOKOL_PRIVATE void _sg_wgpu_commit(void) {
     wgpuCommandEncoderRelease(_sg.wgpu.cmd_enc);
     _sg.wgpu.cmd_enc = 0;
     wgpuQueueSubmit(_sg.wgpu.queue, 1, &wgpu_cmd_buf);
+    _sg_stats_inc(wgpu.transfers.num_queue_submit);
     wgpuCommandBufferRelease(wgpu_cmd_buf);
     _sg.wgpu.retirement.submit_index++;
     _sg.wgpu.retirement.stats.retired_unsubmitted_bytes = 0;
@@ -21759,6 +21885,7 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_pipeline(_sg_pipeline_t* pip) {
         SOKOL_ASSERT(pip->wgpu.cpip);
         SOKOL_ASSERT(_sg.wgpu.cpass_enc);
         wgpuComputePassEncoderSetPipeline(_sg.wgpu.cpass_enc, pip->wgpu.cpip);
+        _sg_stats_inc(wgpu.num_set_pipeline);
         if (shd->wgpu.bg_view_smp_empty) {
             wgpuComputePassEncoderSetBindGroup(_sg.wgpu.cpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, shd->wgpu.bg_view_smp_empty, 0, 0);
             _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
@@ -21770,6 +21897,7 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_pipeline(_sg_pipeline_t* pip) {
         SOKOL_ASSERT(pip->wgpu.rpip);
         SOKOL_ASSERT(_sg.wgpu.rpass_enc);
         wgpuRenderPassEncoderSetPipeline(_sg.wgpu.rpass_enc, pip->wgpu.rpip);
+        _sg_stats_inc(wgpu.num_set_pipeline);
         if (shd->wgpu.bg_view_smp_empty) {
             wgpuRenderPassEncoderSetBindGroup(_sg.wgpu.rpass_enc, _SG_WGPU_VIEW_SMP_BINDGROUP_INDEX, shd->wgpu.bg_view_smp_empty, 0, 0);
             _sg_stats_inc(wgpu.bindings.num_set_bindgroup);
@@ -21813,8 +21941,11 @@ _SOKOL_PRIVATE void _sg_wgpu_apply_uniforms(int ub_slot, const sg_range* data) {
     SOKOL_ASSERT((_sg.wgpu.uniform.offset & (alignment - 1)) == 0);
     SOKOL_ASSERT(data->size <= _SG_WGPU_MAX_UNIFORM_UPDATE_SIZE);
 
-    _sg_stats_inc(wgpu.uniforms.num_set_bindgroup);
     memcpy(_sg.wgpu.uniform.staging + _sg.wgpu.uniform.offset, data->ptr, data->size);
+    _sg_wgpu_uniform_stats_record(ub_slot, (uint32_t)data->size);
+    _sg_stats_add(wgpu.uniforms.size_copy, (uint32_t)data->size);
+    _sg_stats_add(wgpu.transfers.size_write_padding, _sg_roundup_pow2_u32((uint32_t)data->size, alignment) - data->size);
+    _sg_stats_add(wgpu.transfers.size_memcpy, data->size);
     _sg.wgpu.uniform.bind_offsets[ub_slot] = _sg.wgpu.uniform.offset;
     _sg.wgpu.uniform.offset = _sg_roundup_pow2_u32(_sg.wgpu.uniform.offset + (uint32_t)data->size, alignment);
     _sg.wgpu.uniform.dirty = true;
@@ -21885,6 +22016,7 @@ _SOKOL_PRIVATE void _sg_wgpu_write_buffer_unsealed(_sg_buffer_t* buf, const sg_w
     uint8_t* dst_ptr = buf->wgpu.mapped_ptr + desc->dst.offset;
     const uint8_t* src_ptr = ((uint8_t*)desc->src.data.ptr) + desc->src.offset;
     memcpy(dst_ptr, src_ptr, desc->size);
+    _sg_stats_add(wgpu.transfers.size_memcpy, desc->size);
 }
 
 _SOKOL_PRIVATE void _sg_wgpu_write_image_transient(_sg_image_t* img, const sg_write_image_desc* desc, bool first_time_in_frame) {
@@ -21947,6 +22079,8 @@ _SOKOL_PRIVATE void _sg_wgpu_copy_buffer_to_buffer(_sg_buffer_t* src_buf, _sg_bu
         SOKOL_ASSERT((desc->src.offset + wgpu_size) <= (size_t)_sg_roundup_pow2(src_buf->cmn.size, 4));
         SOKOL_ASSERT((desc->dst.offset + wgpu_size) <= (size_t)_sg_roundup_pow2(dst_buf->cmn.size, 4));
         wgpuCommandEncoderCopyBufferToBuffer(_sg.wgpu.cmd_enc, src_buf->wgpu.buf, desc->src.offset, dst_buf->wgpu.buf, desc->dst.offset, wgpu_size);
+        _sg_stats_inc(wgpu.transfers.num_copy_buffer);
+        _sg_stats_add(wgpu.transfers.size_copy_buffer, wgpu_size);
     }
 }
 
@@ -29166,8 +29300,31 @@ SOKOL_API_IMPL sg_stats sg_query_stats(void) {
     _sg_update_alive_free_resource_stats(&_sg.stats.total.pipelines, &_sg.pools.pipeline_pool);
     #if defined(SOKOL_WGPU)
         _sg.stats.wgpu_memory = _sg.wgpu.retirement.stats;
+        const _sg_wgpu_uniform_system_t* u = &_sg.wgpu.uniform;
+        const _sg_pool_t* p = &_sg.wgpu.bindgroups_pool.pool;
+        _sg.stats.wgpu_memory.uniform_gpu_bytes = u->buf ? u->num_bytes : 0;
+        _sg.stats.wgpu_memory.uniform_staging_bytes = u->staging ? u->num_bytes : 0;
+        _sg.stats.wgpu_memory.uniform_profiling_bytes = (uint64_t)u->max_records * sizeof(*u->records);
+        _sg.stats.wgpu_memory.bindgroup_cache_bytes = (uint64_t)_sg.wgpu.bindgroups_cache.num * sizeof(*_sg.wgpu.bindgroups_cache.items)
+            + (uint64_t)p->size * (sizeof(_sg_wgpu_bindgroup_t) + sizeof(uint32_t))
+            + (uint64_t)(p->size > 0 ? p->size - 1 : 0) * sizeof(int);
+        _sg.stats.wgpu_memory.bindgroups_alive = p->size > 0 ? (uint32_t)(p->size - 1 - p->queue_top) : 0;
+        _sg.stats.wgpu_memory.bindgroups_capacity = p->size > 0 ? (uint32_t)(p->size - 1) : 0;
     #endif
     return _sg.stats;
+}
+
+SOKOL_API_IMPL void sg_add_transfer_stats(const sg_frame_stats_transfers* stats) {
+    SOKOL_ASSERT(_sg.valid && stats);
+    _sg_stats_add(external_transfers.num_write_buffer, stats->num_write_buffer);
+    _sg_stats_add(external_transfers.num_write_texture, stats->num_write_texture);
+    _sg_stats_add(external_transfers.num_copy_buffer, stats->num_copy_buffer);
+    _sg_stats_add(external_transfers.num_queue_submit, stats->num_queue_submit);
+    _sg_stats_add(external_transfers.size_write_buffer, stats->size_write_buffer);
+    _sg_stats_add(external_transfers.size_write_texture, stats->size_write_texture);
+    _sg_stats_add(external_transfers.size_write_padding, stats->size_write_padding);
+    _sg_stats_add(external_transfers.size_copy_buffer, stats->size_copy_buffer);
+    _sg_stats_add(external_transfers.size_memcpy, stats->size_memcpy);
 }
 
 SOKOL_API_IMPL sg_trace_hooks sg_install_trace_hooks(const sg_trace_hooks* trace_hooks) {
@@ -31178,6 +31335,15 @@ SOKOL_API_IMPL uint32_t sg_wgpu_frame_timestamp_passes(void) {
         return _sg.wgpu.timestamp_passes;
     #else
         return 0;
+    #endif
+}
+
+SOKOL_API_IMPL void sg_wgpu_profile_uniforms(bool enabled) {
+    SOKOL_ASSERT(_sg.valid);
+    #if defined(SOKOL_WGPU)
+        _sg.wgpu.uniform.profiled = enabled;
+    #else
+        _SOKOL_UNUSED(enabled);
     #endif
 }
 
