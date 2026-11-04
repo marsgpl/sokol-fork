@@ -2063,6 +2063,16 @@ typedef struct sapp_metal_desc {
     bool disable_display_sync;      // feeds into CAMetalLayer.displaySyncEnabled
 } sapp_metal_desc;
 
+typedef struct sapp_macos_desc {
+    bool quiet;                    // invisible, nonactivating window for unattended rendering
+} sapp_macos_desc;
+
+typedef struct sapp_wgpu_desc {
+    bool prefer_low_power;         // otherwise leave adapter preference unspecified
+    bool enable_timestamp_query;   // request the feature when the adapter supports it
+    bool enable_indirect_first_instance;
+} sapp_wgpu_desc;
+
 typedef struct sapp_android_desc {
     bool (*native_event_cb)(const void* native_event);
 } sapp_android_desc;
@@ -2103,6 +2113,8 @@ typedef struct sapp_desc {
     // backend- and platform-specific options
     sapp_gl_desc gl;
     sapp_metal_desc metal;
+    sapp_macos_desc macos;
+    sapp_wgpu_desc wgpu;
     sapp_win32_desc win32;
     sapp_html5_desc html5;
     sapp_ios_desc ios;
@@ -2272,6 +2284,8 @@ SOKOL_APP_API_DECL void sapp_html5_fetch_dropped_file(const sapp_html5_fetch_req
 
 /* macOS: get bridged pointer to macOS NSWindow */
 SOKOL_APP_API_DECL const void* sapp_macos_get_window(void);
+/* macOS+Metal: cap DisplayLink rate at runtime; zero restores the display rate. */
+SOKOL_APP_API_DECL void sapp_macos_set_frame_rate_cap(int fps);
 /* iOS: get bridged pointer to iOS UIWindow */
 SOKOL_APP_API_DECL const void* sapp_ios_get_window(void);
 
@@ -2829,6 +2843,7 @@ typedef struct {
     } timing;
     #if defined(_SAPP_MACOS)
     NSTimer* obscured_timer;
+    int fps_cap;
     #endif
 } _sapp_metal_t;
 #endif
@@ -4010,6 +4025,7 @@ _SOKOL_PRIVATE void _sapp_wgpu_create_swapchain(bool called_from_resize) {
         }
         _sapp.wgpu.surface_format = _sapp_wgpu_pick_render_format(surf_caps.formatCount, surf_caps.formats);
         _sapp.wgpu.swapchain_view_format = _sapp_wgpu_pick_swapchain_view_format(_sapp.wgpu.surface_format);
+        wgpuSurfaceCapabilitiesFreeMembers(surf_caps);
     }
 
     SOKOL_ASSERT(_sapp.wgpu.surface);
@@ -4085,6 +4101,7 @@ _SOKOL_PRIVATE void _sapp_wgpu_discard_swapchain(bool called_from_resize) {
         _sapp.wgpu.msaa_view = 0;
     }
     if (_sapp.wgpu.msaa_tex) {
+        wgpuTextureDestroy(_sapp.wgpu.msaa_tex);
         wgpuTextureRelease(_sapp.wgpu.msaa_tex);
         _sapp.wgpu.msaa_tex = 0;
     }
@@ -4093,6 +4110,7 @@ _SOKOL_PRIVATE void _sapp_wgpu_discard_swapchain(bool called_from_resize) {
         _sapp.wgpu.depth_stencil_view = 0;
     }
     if (_sapp.wgpu.depth_stencil_tex) {
+        wgpuTextureDestroy(_sapp.wgpu.depth_stencil_tex);
         wgpuTextureRelease(_sapp.wgpu.depth_stencil_tex);
         _sapp.wgpu.depth_stencil_tex = 0;
     }
@@ -4219,11 +4237,20 @@ _SOKOL_PRIVATE void _sapp_wgpu_request_device_cb(WGPURequestDeviceStatus status,
 
 _SOKOL_PRIVATE void _sapp_wgpu_create_device_and_swapchain(void) {
     SOKOL_ASSERT(_sapp.wgpu.adapter);
-    size_t cur_feature_index = 1;
+    size_t cur_feature_index = 0;
     #define _SAPP_WGPU_MAX_REQUESTED_FEATURES (16)
-    WGPUFeatureName requiredFeatures[_SAPP_WGPU_MAX_REQUESTED_FEATURES] = {
-        WGPUFeatureName_Depth32FloatStencil8,
-    };
+    WGPUFeatureName requiredFeatures[_SAPP_WGPU_MAX_REQUESTED_FEATURES];
+    if (wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_Depth32FloatStencil8)) {
+        requiredFeatures[cur_feature_index++] = WGPUFeatureName_Depth32FloatStencil8;
+    }
+    if (_sapp.desc.wgpu.enable_timestamp_query && wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_TimestampQuery)) {
+        SOKOL_ASSERT(cur_feature_index < _SAPP_WGPU_MAX_REQUESTED_FEATURES);
+        requiredFeatures[cur_feature_index++] = WGPUFeatureName_TimestampQuery;
+    }
+    if (_sapp.desc.wgpu.enable_indirect_first_instance && wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_IndirectFirstInstance)) {
+        SOKOL_ASSERT(cur_feature_index < _SAPP_WGPU_MAX_REQUESTED_FEATURES);
+        requiredFeatures[cur_feature_index++] = WGPUFeatureName_IndirectFirstInstance;
+    }
     // check for optional features we're interested in
     if (wgpuAdapterHasFeature(_sapp.wgpu.adapter, WGPUFeatureName_TextureCompressionBC)) {
         SOKOL_ASSERT(cur_feature_index < _SAPP_WGPU_MAX_REQUESTED_FEATURES);
@@ -4308,11 +4335,14 @@ _SOKOL_PRIVATE void _sapp_wgpu_request_adapter_cb(WGPURequestAdapterStatus statu
 
 _SOKOL_PRIVATE void _sapp_wgpu_create_adapter(void) {
     SOKOL_ASSERT(_sapp.wgpu.instance);
-    // FIXME: power preference?
+    _SAPP_STRUCT(WGPURequestAdapterOptions, opts);
+    if (_sapp.desc.wgpu.prefer_low_power) {
+        opts.powerPreference = WGPUPowerPreference_LowPower;
+    }
     _SAPP_STRUCT(WGPURequestAdapterCallbackInfo, cb_info);
     cb_info.mode = _sapp_wgpu_callbackmode();
     cb_info.callback = _sapp_wgpu_request_adapter_cb;
-    WGPUFuture future = wgpuInstanceRequestAdapter(_sapp.wgpu.instance, 0, cb_info);
+    WGPUFuture future = wgpuInstanceRequestAdapter(_sapp.wgpu.instance, &opts, cb_info);
     #if defined(_SAPP_WGPU_HAS_WAIT)
         _sapp_wgpu_await(future);
     #else
@@ -5409,7 +5439,6 @@ _SOKOL_PRIVATE void _sapp_mtl_swapchain_resize(int width, int height) {
 
 _SOKOL_PRIVATE id<CAMetalDrawable> _sapp_mtl_swapchain_next(void) {
     id<CAMetalDrawable> drawable = [_sapp.mtl.layer nextDrawable];
-    SOKOL_ASSERT(drawable != nil);
     return drawable;
 }
 
@@ -5467,6 +5496,11 @@ _SOKOL_PRIVATE double _sapp_macos_mtl_timing_frame_duration(void) {
     }
 }
 
+_SOKOL_PRIVATE float _sapp_macos_mtl_preferred_fps(int max_fps) {
+    const float fps = (float)max_fps / _sapp.desc.swap_interval;
+    return ((_sapp.mtl.fps_cap > 0) && (_sapp.mtl.fps_cap < fps)) ? (float)_sapp.mtl.fps_cap : fps;
+}
+
 _SOKOL_PRIVATE void _sapp_macos_mtl_start_display_link(void) {
     if (nil != _sapp.mtl.display_link) {
         _sapp.mtl.display_link.paused = false;
@@ -5478,7 +5512,7 @@ _SOKOL_PRIVATE void _sapp_macos_mtl_start_display_link(void) {
     SOKOL_ASSERT(nil != _sapp.macos.view);
     NSInteger max_fps = _sapp_macos_max_fps();
     _sapp.mtl.display_link = [_sapp.macos.view displayLinkWithTarget:_sapp.macos.view selector:@selector(displayLinkFired:)];
-    const float preferred_fps = max_fps / _sapp.desc.swap_interval;
+    const float preferred_fps = _sapp_macos_mtl_preferred_fps((int)max_fps);
     const CAFrameRateRange frame_rate_range = { preferred_fps, preferred_fps, preferred_fps };
     _sapp.mtl.display_link.preferredFrameRateRange = frame_rate_range;
     [_sapp.mtl.display_link addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSRunLoopCommonModes];
@@ -5852,6 +5886,10 @@ _SOKOL_PRIVATE void _sapp_macos_run(const sapp_desc* desc) {
     _sapp_init_state(desc);
     _sapp_macos_init_keytable();
     [NSApplication sharedApplication];
+    if (_sapp.desc.macos.quiet) {
+        NSApp.activationPolicy = NSApplicationActivationPolicyAccessory;
+        _sapp.fullscreen = false;
+    }
 
     // set the application dock icon as early as possible, otherwise
     // the dummy icon will be visible for a short time
@@ -6205,7 +6243,8 @@ _SOKOL_PRIVATE void _sapp_macos_frame(void) {
 - (void)applicationDidFinishLaunching:(NSNotification*)aNotification {
     _SOKOL_UNUSED(aNotification);
     // NOTE: keep activationPolicy in front of window creation (see https://github.com/floooh/sokol/issues/1500)
-    NSApp.activationPolicy = NSApplicationActivationPolicyRegular;
+    const bool quiet = _sapp.desc.macos.quiet;
+    NSApp.activationPolicy = quiet ? NSApplicationActivationPolicyAccessory : NSApplicationActivationPolicyRegular;
     _sapp_macos_init_cursors();
     if ((_sapp.window_width == 0) || (_sapp.window_height == 0)) {
         _sapp_macos_init_default_dimensions();
@@ -6242,28 +6281,42 @@ _SOKOL_PRIVATE void _sapp_macos_frame(void) {
     _sapp.macos.window.contentView = _sapp.macos.view;
     [_sapp.macos.window makeFirstResponder:_sapp.macos.view];
     [_sapp.macos.window center];
+    if (quiet) {
+        _sapp.macos.window.alphaValue = 0.0;
+        _sapp.macos.window.ignoresMouseEvents = YES;
+        _sapp.macos.window.collectionBehavior =
+            NSWindowCollectionBehaviorCanJoinAllSpaces |
+            NSWindowCollectionBehaviorStationary |
+            NSWindowCollectionBehaviorIgnoresCycle;
+    }
     _sapp.valid = true;
-    if (_sapp.fullscreen) {
+    if (_sapp.fullscreen && !quiet) {
         /* ^^^ on GL, this already toggles a rendered frame, so set the valid flag before */
         [_sapp.macos.window toggleFullScreen:self];
     }
-    [NSApp activateIgnoringOtherApps:YES];
-    [_sapp.macos.window makeKeyAndOrderFront:nil];
+    if (quiet) {
+        [_sapp.macos.window orderBack:nil];
+    } else {
+        [NSApp activateIgnoringOtherApps:YES];
+        [_sapp.macos.window makeKeyAndOrderFront:nil];
+    }
     _sapp_macos_update_dimensions();
 
     // workaround for window not being focused during a long init callback
     // for details see: https://github.com/floooh/sokol/pull/982
     // also see: https://gitlab.gnome.org/GNOME/gtk/-/issues/2342
-    NSEvent *focusevent = [NSEvent otherEventWithType:NSEventTypeAppKitDefined
-        location:NSZeroPoint
-        modifierFlags:0x40
-        timestamp:0
-        windowNumber:0
-        context:nil
-        subtype:NSEventSubtypeApplicationActivated
-        data1:0
-        data2:0];
-    [NSApp postEvent:focusevent atStart:YES];
+    if (!quiet) {
+        NSEvent *focusevent = [NSEvent otherEventWithType:NSEventTypeAppKitDefined
+            location:NSZeroPoint
+            modifierFlags:0x40
+            timestamp:0
+            windowNumber:0
+            context:nil
+            subtype:NSEventSubtypeApplicationActivated
+            data1:0
+            data2:0];
+        [NSApp postEvent:focusevent atStart:YES];
+    }
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
@@ -7842,8 +7895,13 @@ _SOKOL_PRIVATE EM_BOOL _sapp_emsc_size_changed(int event_type, const EmscriptenU
     if (_sapp.desc.high_dpi) {
         _sapp.dpi_scale = emscripten_get_device_pixel_ratio();
     }
-    _sapp.framebuffer_width = _sapp_roundf_gzero(w * _sapp.dpi_scale);
-    _sapp.framebuffer_height = _sapp_roundf_gzero(h * _sapp.dpi_scale);
+    const int fb_w = _sapp_roundf_gzero(w * _sapp.dpi_scale);
+    const int fb_h = _sapp_roundf_gzero(h * _sapp.dpi_scale);
+    if ((fb_w == _sapp.framebuffer_width) && (fb_h == _sapp.framebuffer_height)) {
+        return true;
+    }
+    _sapp.framebuffer_width = fb_w;
+    _sapp.framebuffer_height = fb_h;
     emscripten_set_canvas_element_size(_sapp.html5_canvas_selector, _sapp.framebuffer_width, _sapp.framebuffer_height);
     #if defined(SOKOL_WGPU)
         // on WebGPU: recreate size-dependent rendering surfaces
@@ -14710,7 +14768,9 @@ SOKOL_API_IMPL bool sapp_is_fullscreen(void) {
 
 SOKOL_API_IMPL void sapp_toggle_fullscreen(void) {
     #if defined(_SAPP_MACOS)
-    _sapp_macos_toggle_fullscreen();
+    if (!_sapp.desc.macos.quiet) {
+        _sapp_macos_toggle_fullscreen();
+    }
     #elif defined(_SAPP_WIN32)
     _sapp_win32_toggle_fullscreen();
     #elif defined(_SAPP_LINUX)
@@ -15028,6 +15088,10 @@ SOKOL_API_IMPL sapp_swapchain sapp_acquire_swapchain(void) {
             }
         #endif
         res.metal.current_drawable = (__bridge const void*) _sapp_mtl_swapchain_next();
+        if (!res.metal.current_drawable) {
+            res.invalid = true;
+            return res;
+        }
         res.metal.depth_stencil_texture = (__bridge const void*) _sapp.mtl.depth_tex;
         res.metal.msaa_color_texture = (__bridge const void*) _sapp.mtl.msaa_tex;
     #endif
@@ -15099,6 +15163,20 @@ SOKOL_API_IMPL const void* sapp_macos_get_window(void) {
         return obj;
     #else
         return 0;
+    #endif
+}
+
+SOKOL_API_IMPL void sapp_macos_set_frame_rate_cap(int fps) {
+    SOKOL_ASSERT(fps >= 0);
+    #if defined(_SAPP_MACOS) && defined(SOKOL_METAL)
+        _sapp.mtl.fps_cap = fps;
+        if (_sapp.mtl.display_link) {
+            const float rate = _sapp_macos_mtl_preferred_fps((int)_sapp_macos_max_fps());
+            const CAFrameRateRange range = { rate, rate, rate };
+            _sapp.mtl.display_link.preferredFrameRateRange = range;
+        }
+    #else
+        _SOKOL_UNUSED(fps);
     #endif
 }
 
