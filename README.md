@@ -1,3 +1,16 @@
+# ⚠️ This is a fork of Sokol for Sul Rim
+
+> [!WARNING]
+> **This repository is a modified fork, not the official Sokol repository.**
+> It contains custom APIs and backend changes for [Sul Rim](https://sulrim.com).
+>
+> **Original project and upstream source: [floooh/sokol](https://github.com/floooh/sokol).**
+>
+> The documentation below is inherited from upstream and may not describe this
+> fork's changes or compatibility differences.
+
+---
+
 <p align="center">
     <img src="assets/logo_full_large.png" style="width: 60%" /><br/><br/>Simple
     <a href="https://github.com/nothings/stb/blob/master/docs/stb_howto.txt">STB-style</a>
